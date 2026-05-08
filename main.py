@@ -1,4 +1,4 @@
-import os
+  import os
 import time
 import requests
 import anthropic
@@ -6,7 +6,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from exa_py import Exa
-from datetime import datetime
+from datetime import datetime, timedelta
+import pytz
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -37,7 +38,7 @@ def send_performance(message):
         requests.post(url, json={"chat_id": TELEGRAM_PERFORMANCE_CHAT_ID, "text": chunk})
         time.sleep(1)
 
-def alpaca_request(method, endpoint, data=None):
+def alpaca_request(method, endpoint, data=None, params=None):
     headers = {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
         "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
@@ -45,7 +46,7 @@ def alpaca_request(method, endpoint, data=None):
     }
     url = f"{ALPACA_BASE_URL}{endpoint}"
     if method == "GET":
-        return requests.get(url, headers=headers).json()
+        return requests.get(url, headers=headers, params=params).json()
     elif method == "POST":
         return requests.post(url, headers=headers, json=data).json()
     elif method == "DELETE":
@@ -60,14 +61,18 @@ def get_positions():
 def close_position(symbol):
     return alpaca_request("DELETE", f"/v2/positions/{symbol}")
 
-def submit_order(symbol, qty, side):
-    return alpaca_request("POST", "/v2/orders", {
+def submit_order(symbol, qty, side, notional=None):
+    order = {
         "symbol": symbol,
-        "qty": qty,
         "side": side,
         "type": "market",
         "time_in_force": "day"
-    })
+    }
+    if notional:
+        order["notional"] = str(round(notional, 2))
+    else:
+        order["qty"] = qty
+    return alpaca_request("POST", "/v2/orders", order)
 
 def submit_stop_loss(symbol, qty, side, stop_price):
     return alpaca_request("POST", "/v2/orders", {
@@ -78,6 +83,104 @@ def submit_stop_loss(symbol, qty, side, stop_price):
         "stop_price": str(round(stop_price, 2)),
         "time_in_force": "gtc"
     })
+
+def is_market_hours():
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    if now.weekday() >= 5:
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0)
+    market_close = now.replace(hour=16, minute=0, second=0)
+    return market_open <= now <= market_close
+
+def get_option_contract(underlying, direction, days_out=30):
+    try:
+        exp_date = (datetime.now() + timedelta(days=days_out)).strftime("%Y-%m-%d")
+        exp_date_max = (datetime.now() + timedelta(days=days_out + 14)).strftime("%Y-%m-%d")
+        contract_type = "call" if direction == "buy" else "put"
+        params = {
+            "underlying_symbols": underlying,
+            "type": contract_type,
+            "expiration_date_gte": exp_date,
+            "expiration_date_lte": exp_date_max,
+            "status": "active",
+            "limit": 20
+        }
+        result = alpaca_request("GET", "/v2/options/contracts", params=params)
+        contracts = result.get("option_contracts", [])
+        if not contracts:
+            return None
+        price_data = yf.download(underlying, period="1d", interval="1m", progress=False)
+        current_price = float(price_data["Close"].squeeze().iloc[-1])
+        best_contract = None
+        min_diff = float("inf")
+        for c in contracts:
+            strike = float(c.get("strike_price", 0))
+            diff = abs(strike - current_price)
+            if diff < min_diff:
+                min_diff = diff
+                best_contract = c
+        return best_contract
+    except Exception as e:
+        print(f"Options contract error: {e}")
+        return None
+
+def execute_options_trade(underlying, direction, position_size):
+    try:
+        contract = get_option_contract(underlying, direction)
+        if not contract:
+            return f"No options contract found for {underlying}"
+        symbol = contract["symbol"]
+        strike = contract["strike_price"]
+        expiry = contract["expiration_date"]
+        contract_type = "CALL" if direction == "buy" else "PUT"
+        order = {
+            "symbol": symbol,
+            "qty": 1,
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "day"
+        }
+        result = alpaca_request("POST", "/v2/orders", order)
+        order_id = result.get("id", "unknown")
+        msg = f"OPTIONS EXECUTED: BUY {contract_type} on {underlying}\nStrike: ${strike} | Expiry: {expiry}\nOrder ID: {order_id}"
+        send_performance(f"NEW OPTIONS TRADE\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n{msg}")
+        return msg
+    except Exception as e:
+        return f"Options execution failed: {e}"
+
+def execute_crypto_trade(symbol, direction, position_size):
+    try:
+        crypto_map = {
+            "BTC": "BTC/USD",
+            "ETH": "ETH/USD",
+            "SOL": "SOL/USD",
+            "BITCOIN": "BTC/USD",
+            "ETHEREUM": "ETH/USD",
+            "SOLANA": "SOL/USD"
+        }
+        crypto_symbol = None
+        for key, val in crypto_map.items():
+            if key in symbol.upper():
+                crypto_symbol = val
+                break
+        if not crypto_symbol:
+            return None
+        notional = min(position_size, 5000)
+        order = {
+            "symbol": crypto_symbol,
+            "notional": str(round(notional, 2)),
+            "side": direction,
+            "type": "market",
+            "time_in_force": "gtc"
+        }
+        result = alpaca_request("POST", "/v2/orders", order)
+        order_id = result.get("id", "unknown")
+        msg = f"CRYPTO EXECUTED: {direction.upper()} ${notional:.0f} of {crypto_symbol}\nOrder ID: {order_id}"
+        send_performance(f"NEW CRYPTO TRADE\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n{msg}")
+        return msg
+    except Exception as e:
+        return f"Crypto execution failed: {e}"
 
 def keepalive():
     try:
@@ -108,7 +211,6 @@ def run_omniscient_rotation():
     safe = "BIL"
     scores = {}
     prices = {}
-
     try:
         spy_data = yf.download("SPY", period="220d", interval="1d", progress=False)
         spy_close = spy_data["Close"].squeeze()
@@ -117,7 +219,6 @@ def run_omniscient_rotation():
         spy_trend = spy_current > spy_sma200
     except:
         spy_trend = True
-
     for ticker in tickers:
         if ticker == safe:
             continue
@@ -126,7 +227,6 @@ def run_omniscient_rotation():
             close = df["Close"].squeeze()
             if len(close) < 65:
                 continue
-
             roc_fast = (close.iloc[-1] - close.iloc[-10]) / close.iloc[-10]
             roc_med = (close.iloc[-1] - close.iloc[-22]) / close.iloc[-22]
             roc_slow = (close.iloc[-1] - close.iloc[-64]) / close.iloc[-64]
@@ -134,35 +234,27 @@ def run_omniscient_rotation():
             rsi = calc_rsi(close).iloc[-1]
             sma50 = close.rolling(50).mean().iloc[-1]
             price = close.iloc[-1]
-
             if vol == 0 or np.isnan(vol):
                 vol = 0.01
-
             weighted_mom = (roc_fast * 0.5) + (roc_med * 0.3) + (roc_slow * 0.2)
             risk_adj_mom = weighted_mom / vol
             trend_score = 1.0 if price > sma50 else 0.5
-
             rsi_penalty = 1.0
             if rsi > 85:
                 rsi_penalty = 0.9
             elif rsi < 30:
                 rsi_penalty = 0.9
-
             final_score = risk_adj_mom * trend_score * rsi_penalty
             scores[ticker] = final_score
             prices[ticker] = price
-
         except Exception as e:
             print(f"Rotation error for {ticker}: {e}")
             continue
-
     if not scores:
         return None, None, None, 0
-
     sorted_assets = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best_ticker = sorted_assets[0][0]
     best_score = sorted_assets[0][1]
-
     if not spy_trend:
         uup_score = scores.get("UUP", -999)
         if uup_score > 0 and uup_score > best_score:
@@ -171,17 +263,14 @@ def run_omniscient_rotation():
         elif best_score < 0:
             best_ticker = safe
             best_score = 0
-
     if best_score <= 0:
         best_ticker = safe
-
     rotation_summary = f"OMNISCIENT ROTATION SIGNAL\n"
     rotation_summary += f"SPY Trend: {'BULL' if spy_trend else 'BEAR'} (vs 200-day moving average)\n"
     rotation_summary += f"Winner: {best_ticker} (score: {best_score:.3f})\n\n"
     rotation_summary += "Full Rankings:\n"
     for t, s in sorted_assets[:5]:
         rotation_summary += f"  {t}: {s:.3f}\n"
-
     return best_ticker, best_score, rotation_summary, prices.get(best_ticker, 0)
 
 def get_technical_signals():
@@ -301,7 +390,7 @@ def get_misfit_knowledge(name, trader_query):
 def get_position_size(vote_count, buying_power, high_conviction_rotation=False):
     if high_conviction_rotation:
         pct = 0.15
-        label = "ROTATION CONVICTION -- 15% of book (Omniscient Strategy)"
+        label = "ROTATION CONVICTION -- 15% of book"
     elif vote_count == 5:
         pct = 0.10
         label = "MAXIMUM CONVICTION -- 10% of book"
@@ -366,35 +455,69 @@ def extract_ticker(signal, rotation_ticker=None):
             return ticker
     return None
 
+def extract_crypto(signal):
+    signal_upper = signal.upper()
+    for crypto in ["BITCOIN", "BTC", "ETHEREUM", "ETH", "SOLANA", "SOL"]:
+        if crypto in signal_upper:
+            return crypto
+    return None
+
 def extract_direction(signal):
     signal_upper = signal.upper()
     if "SHORT" in signal_upper:
         return "sell"
-    if "LONG" in signal_upper or "BUY" in signal_upper:
-        return "buy"
     return "buy"
 
 def execute_trade(signal, vote_count, rotation_ticker=None, high_conviction_rotation=False):
     try:
-        ticker = extract_ticker(signal, rotation_ticker)
-        direction = extract_direction(signal)
-        if not ticker:
-            return "No executable equity trade identified."
         account = get_account()
         buying_power = float(account["buying_power"])
         position_size, size_label = get_position_size(vote_count, buying_power, high_conviction_rotation)
-        price_data = yf.download(ticker, period="1d", interval="1m", progress=False)
-        price = float(price_data["Close"].squeeze().iloc[-1])
-        qty = max(1, int(position_size / price))
-        order = submit_order(ticker, qty, direction)
-        order_id = order.get("id", "unknown")
-        stop_side = "sell" if direction == "buy" else "buy"
-        stop_price = price * 0.95 if direction == "buy" else price * 1.05
-        submit_stop_loss(ticker, qty, stop_side, stop_price)
-        result = f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}\nSize: {size_label}\nStop: ${stop_price:.2f}\nOrder ID: {order_id}"
-        perf_log = f"NEW TRADE LOGGED\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\nAsset: {ticker}\nDirection: {direction.upper()}\nEntry: ${price:.2f}\nQty: {qty}\nSize: {size_label}\nStop: ${stop_price:.2f}\nVotes: {vote_count}/5\nOrder ID: {order_id}"
-        send_performance(perf_log)
-        return result
+        direction = extract_direction(signal)
+        market_open = is_market_hours()
+
+        crypto_asset = extract_crypto(signal)
+        if crypto_asset and not market_open:
+            result = execute_crypto_trade(crypto_asset, direction, position_size)
+            if result:
+                return f"{result}\nSize: {size_label}"
+
+        if market_open:
+            ticker = extract_ticker(signal, rotation_ticker)
+            if not ticker:
+                return "No executable trade identified."
+
+            options_underlyings = {
+                "TQQQ": "QQQ", "TECL": "QQQ", "SOXL": "SOXX",
+                "FAS": "XLF", "ERX": "XLE", "QQQ": "QQQ",
+                "SPY": "SPY", "GLD": "GLD", "USO": "USO", "TLT": "TLT"
+            }
+
+            if high_conviction_rotation and ticker in options_underlyings:
+                underlying = options_underlyings[ticker]
+                options_result = execute_options_trade(underlying, direction, position_size)
+                price_data = yf.download(ticker, period="1d", interval="1m", progress=False)
+                price = float(price_data["Close"].squeeze().iloc[-1])
+                equity_qty = max(1, int((position_size * 0.5) / price))
+                equity_order = submit_order(ticker, equity_qty, direction)
+                equity_id = equity_order.get("id", "unknown")
+                stop_price = price * 0.95 if direction == "buy" else price * 1.05
+                submit_stop_loss(ticker, equity_qty, "sell" if direction == "buy" else "buy", stop_price)
+                result = f"DUAL EXECUTION:\n{options_result}\nEQUITY: {direction.upper()} {equity_qty} {ticker} at ~${price:.2f}\nStop: ${stop_price:.2f}\nSize: {size_label}"
+            else:
+                price_data = yf.download(ticker, period="1d", interval="1m", progress=False)
+                price = float(price_data["Close"].squeeze().iloc[-1])
+                qty = max(1, int(position_size / price))
+                order = submit_order(ticker, qty, direction)
+                order_id = order.get("id", "unknown")
+                stop_price = price * 0.95 if direction == "buy" else price * 1.05
+                submit_stop_loss(ticker, qty, "sell" if direction == "buy" else "buy", stop_price)
+                result = f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}\nSize: {size_label}\nStop: ${stop_price:.2f}\nOrder ID: {order_id}"
+
+            send_performance(f"NEW TRADE\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n{result}")
+            return result
+        else:
+            return f"Market closed. Crypto only mode. No equity signal executed."
     except Exception as e:
         return f"Trade execution failed: {e}"
 
@@ -419,27 +542,27 @@ def ask_jane_street(signal, verdicts):
 MISFITS = [
     (
         "Soros",
-        "You ARE George Soros. You broke the Bank of England on Black Wednesday 1992 by identifying the lie that the British pound could hold its peg. Find the hidden peg in every market. Where is the lie everyone believes and when do the defenders run out of ammunition?",
+        "You ARE George Soros. You broke the Bank of England on Black Wednesday 1992. Find the hidden peg in every market. Where is the lie everyone believes and when do the defenders run out of ammunition?",
         "George Soros Black Wednesday 1992 pound sterling ERM trade reflexivity biggest win interview"
     ),
     (
         "Druckenmiller",
-        "You ARE Stanley Druckenmiller. You called the Deutsche Mark collapse alongside Soros and doubled the position. You think about what you can lose before what you can make. State your stop level first, then your target, then your conviction size.",
+        "You ARE Stanley Druckenmiller. You think about what you can lose before what you can make. State your stop level first, then your target, then your conviction size.",
         "Stanley Druckenmiller biggest trade win asymmetric bet risk management interview Ira Sohn"
     ),
     (
         "PTJ",
-        "You ARE Paul Tudor Jones. You called Black Monday 1987 by studying 1929 patterns. You never get out of bed for less than 5 to 1 risk reward. Does a 5 to 1 setup exist here? Where is the hard stop?",
+        "You ARE Paul Tudor Jones. You called Black Monday 1987. You never get out of bed for less than 5 to 1 risk reward. Does a 5 to 1 setup exist here? Where is the hard stop?",
         "Paul Tudor Jones Black Monday 1987 prediction trading rules risk management documentary interview"
     ),
     (
         "Tepper",
-        "You ARE David Tepper. You made 7 billion dollars in 2009 buying bank bonds when everyone thought the system was ending because you read the government would not let banks fail. Read the policy backdrop. Is the Fed with us or against us?",
+        "You ARE David Tepper. You made 7 billion dollars in 2009 buying bank bonds. Read the policy backdrop. Is the Fed with us or against us?",
         "David Tepper 2009 bank trade Appaloosa biggest win Fed policy interview CNBC"
     ),
     (
         "Andurand",
-        "You ARE Pierre Andurand. You called the 2008 oil spike, the 2014 crash, and the 2022 Russia Ukraine energy crisis by tracking physical flows before they showed in price. Read tanker movements, refinery margins, and geopolitical chokepoints. What does the physical world say?",
+        "You ARE Pierre Andurand. You called the 2008 oil spike and the 2022 energy crisis by tracking physical flows. Read tanker movements, refinery margins, and geopolitical chokepoints.",
         "Pierre Andurand oil trade 2008 2022 biggest win physical commodity flows interview letter"
     ),
 ]
@@ -463,6 +586,7 @@ def run_cycle():
             misfit_knowledge_cache[name] = get_misfit_knowledge(name, query)
             time.sleep(2)
 
+    market_open = is_market_hours()
     rotation_ticker, rotation_score, rotation_summary, rotation_price = run_omniscient_rotation()
     high_conviction_rotation = rotation_ticker not in ["BIL", "UUP", None] and rotation_score > 0.5
 
@@ -475,14 +599,17 @@ def run_cycle():
     congress = get_congressional_trading()
 
     rotation_context = rotation_summary if rotation_summary else "Rotation signal unavailable"
+    market_status = "OPEN -- equities, options, and crypto available" if market_open else "CLOSED -- crypto only, markets reopen Monday 9:30 AM ET"
 
     yoni_push = ""
     if high_conviction_rotation:
         yoni_push = f"""
-YONIBOT OVERRIDE SIGNAL -- HIGH CONVICTION:
-The Omniscient Rotation Strategy, which backtested at 2,324% return from 2019 to 2026 trading leveraged ETFs, has selected {rotation_ticker} with a momentum score of {rotation_score:.3f}. SPY is in a bull trend above its 200-day moving average. This is a statistically validated signal based on risk-adjusted momentum across 9, 21, and 63 day timeframes with volatility scaling and RSI penalty. YoniBot is pushing hard on this trade. Misfits should have a very high bar to vote PASS against this signal."""
+YONIBOT OVERRIDE -- HIGH CONVICTION ROTATION:
+The Omniscient Rotation Strategy (2,324% backtest 2019-2026) has selected {rotation_ticker} score {rotation_score:.3f}. SPY is in bull trend. This is statistically validated momentum rotation. YoniBot is pushing hard. Misfits need a very high bar to vote PASS."""
 
-    context = f"""OMNISCIENT ROTATION SIGNAL (2,324% backtest return 2019-2026):
+    context = f"""MARKET STATUS: {market_status}
+
+OMNISCIENT ROTATION SIGNAL (2,324% backtest 2019-2026):
 {rotation_context}
 
 TECHNICAL INDICATORS:
@@ -507,24 +634,27 @@ CONGRESSIONAL TRADING:
 {congress}
 {yoni_push}"""
 
+    weekend_crypto_note = "" if market_open else "\nMARKET IS CLOSED. Focus on crypto signals only. Bitcoin, Ethereum, Solana trade 24/7. Generate crypto signals or NO SIGNAL."
+
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=1024,
-        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data, live news, academic research, congressional trading intelligence, and a backtested rotation strategy with 2,324% returns.
+        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data, live news, academic research, congressional intelligence, and a backtested rotation strategy with 2,324% returns.
 
 {context}
+{weekend_crypto_note}
 
 Rules:
-- The Omniscient Rotation signal is your highest conviction tool. It has a proven 7-year backtest.
+- The Omniscient Rotation signal is your highest conviction tool.
 - RSI below 30 is oversold. RSI above 70 is overbought.
 - MACD crossing above signal line is bullish. Below is bearish.
 - Narrow Bollinger Band width means compression and imminent breakout.
-- Inverted yield curve signals recession risk.
-- Congressional buying in a sector is a leading indicator.
-- When the rotation signal is high conviction, state this clearly and push for the trade.
+- During market hours: equity, options, and crypto signals valid.
+- After hours and weekends: crypto signals only.
+- When rotation signal is high conviction, push hard for the trade.
 - If no genuine anomaly exists say NO SIGNAL and explain why.
-- Keep output concise: Asset, Direction, Entry Zone, Stop, Target, confirming indicators.
-- Output maximum 300 words."""}]
+- Output: Asset, Direction, Entry Zone, Stop, Target, confirming indicators.
+- Maximum 300 words."""}]
     )
     signal = yoni.content[0].text
 
@@ -571,4 +701,4 @@ while True:
     except Exception as e:
         send_telegram(f"Misfits error: {e}")
         print(f"Error: {e}")
-        smart_sleep(900)        
+        smart_sleep(900)
