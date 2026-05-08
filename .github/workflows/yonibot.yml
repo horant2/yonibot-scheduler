@@ -1,0 +1,26 @@
+name: YoniBot Scheduler
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger YoniBot session
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AGENT_ID: ${{ secrets.AGENT_ID }}
+        run: |
+          curl -X POST https://api.anthropic.com/v1/agents/$AGENT_ID/sessions \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d '{
+              "message": "Run your research and market loops. Send summary to Telegram.",
+              "environment_id": "env_01PQxqs92urFH7Q3uGucAu1z"
+            }'
