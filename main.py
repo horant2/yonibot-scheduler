@@ -160,6 +160,21 @@ def get_geopolitical_news():
     except Exception as e:
         return f"Geopolitical news unavailable: {e}"
 
+def get_congressional_trading():
+    try:
+        results = exa.search_and_contents(
+            "congress senator representative stock trade purchase sale disclosure 2026",
+            num_results=5,
+            include_domains=["quiverquant.com", "capitoltrades.com", "housestockwatcher.com", "senatestockwatcher.com"],
+            text={"max_characters": 300}
+        )
+        trades = []
+        for r in results.results:
+            trades.append(f"{r.title}: {r.text[:200]}")
+        return "\n\n".join(trades) if trades else "No recent congressional trades found"
+    except Exception as e:
+        return f"Congressional trading unavailable: {e}"
+
 def get_position_size(vote_count, buying_power):
     if vote_count == 5:
         pct = 0.10
@@ -187,10 +202,8 @@ def check_stop_losses():
             stop_triggered = False
             if side == "long" and unrealized_pnl_pct <= -5:
                 stop_triggered = True
-                close_side = "sell"
             elif side == "short" and unrealized_pnl_pct <= -5:
                 stop_triggered = True
-                close_side = "buy"
             if stop_triggered:
                 close_position(symbol)
                 closed.append(f"STOP LOSS: Closed {symbol} at ${current_price:.2f}. Loss: {unrealized_pnl_pct:.1f}%")
@@ -255,7 +268,7 @@ MISFITS = [
     ("Soros", "You ARE George Soros. Find the hidden peg. Where is the lie everyone believes and when does it break?"),
     ("Druckenmiller", "You ARE Stanley Druckenmiller. State your stop level, your target, and your conviction size."),
     ("PTJ", "You ARE Paul Tudor Jones. Does a 5 to 1 risk/reward setup exist? Where is the stop?"),
-    ("Tepper", "You ARE David Tepper. Is the Fed with us or against us on this trade?"),
+    ("Tepper", "You ARE David Tepper. Is the Fed with us or against us on this trade? What are congressional insiders doing?"),
     ("Andurand", "You ARE Pierre Andurand. What does this mean for physical commodity flows and geopolitical supply disruption?"),
 ]
 
@@ -268,6 +281,7 @@ def run_cycle():
     arxiv = get_arxiv_signals()
     news = get_market_news()
     geo = get_geopolitical_news()
+    congress = get_congressional_trading()
 
     context = f"""TECHNICAL INDICATORS:
 {technical}
@@ -285,12 +299,15 @@ MARKET NEWS:
 {news}
 
 GEOPOLITICAL NEWS:
-{geo}"""
+{geo}
+
+CONGRESSIONAL TRADING:
+{congress}"""
 
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=1024,
-        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data, live news, and cutting edge academic research. Find genuine anomalies only.
+        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data, live news, academic research, and congressional trading intelligence. Find genuine anomalies only.
 
 {context}
 
@@ -299,7 +316,8 @@ Rules:
 - MACD crossing above signal line is bullish. Below is bearish.
 - Narrow Bollinger Band width means compression and imminent breakout.
 - Inverted yield curve signals recession risk.
-- Only generate a signal if at least two indicators confirm the same direction AND news supports the thesis.
+- Congressional buying in a sector is a leading indicator -- politicians have information advantage.
+- Only generate a signal if at least two indicators confirm the same direction AND news or congressional activity supports the thesis.
 - If no genuine anomaly exists say NO SIGNAL and explain why.
 - Keep output concise: Asset, Direction, Entry Zone, Stop, Target, confirming indicators only.
 - Output maximum 300 words."""}]
