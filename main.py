@@ -6,12 +6,31 @@ import anthropic
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message[:4096]})
+
+def get_market_data():
+    symbols = ["SPY", "QQQ", "GLD", "USO", "BTC-USD"]
+    data = []
+    for symbol in symbols:
+        try:
+            r = requests.get(f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}")
+            q = r.json()
+            data.append(f"{symbol}: price={q.get('c')}, change={q.get('dp')}%")
+        except:
+            pass
+    crypto = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true").json()
+    data.append(f"BTC: ${crypto['bitcoin']['usd']} ({crypto['bitcoin']['usd_24h_change']:.1f}%)")
+    data.append(f"ETH: ${crypto['ethereum']['usd']} ({crypto['ethereum']['usd_24h_change']:.1f}%)")
+    data.append(f"SOL: ${crypto['solana']['usd']} ({crypto['solana']['usd_24h_change']:.1f}%)")
+    fear = requests.get("https://api.alternative.me/fng/").json()
+    data.append(f"Fear & Greed: {fear['data'][0]['value']} ({fear['data'][0]['value_classification']})")
+    return "\n".join(data)
 
 def ask_misfit(name, persona, signal):
     msg = client.messages.create(
@@ -39,10 +58,12 @@ MISFITS = [
 ]
 
 def run_cycle():
+    market_data = get_market_data()
+
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=1024,
-        messages=[{"role": "user", "content": "You are YoniBot. Scan arXiv q-fin papers and live market signals. Output a concise trade signal with asset, direction, entry zone, stop, and target."}]
+        messages=[{"role": "user", "content": f"You are YoniBot. Here is live market data:\n{market_data}\n\nAlso scan arXiv q-fin papers for tradeable anomalies. Output a concise trade signal with asset, direction, entry zone, stop, and target."}]
     )
     signal = yoni.content[0].text
 
