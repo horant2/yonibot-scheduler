@@ -83,9 +83,9 @@ def get_technical_signals():
 
 def get_yield_curve():
     try:
-        t2 = yf.download("^IRX", period="5d", progress=False)["Close"].iloc[-1].item()
-        t10 = yf.download("^TNX", period="5d", progress=False)["Close"].iloc[-1].item()
-        t30 = yf.download("^TYX", period="5d", progress=False)["Close"].iloc[-1].item()
+        t2 = yf.download("^IRX", period="5d", progress=False)["Close"].squeeze().iloc[-1]
+        t10 = yf.download("^TNX", period="5d", progress=False)["Close"].squeeze().iloc[-1]
+        t30 = yf.download("^TYX", period="5d", progress=False)["Close"].squeeze().iloc[-1]
         spread = t10 - t2
         return f"2Y={t2:.2f}% 10Y={t10:.2f}% 30Y={t30:.2f}% Spread(10-2)={spread:.2f}%"
     except:
@@ -166,7 +166,7 @@ def execute_trade(signal):
         buying_power = float(account["buying_power"])
         position_size = min(buying_power * 0.05, 5000)
         price_data = yf.download(ticker, period="1d", interval="1m", progress=False)
-        price = float(price_data["Close"].iloc[-1])
+        price = float(price_data["Close"].squeeze().iloc[-1])
         qty = max(1, int(position_size / price))
         order = submit_order(ticker, qty, direction)
         order_id = order.get("id", "unknown")
