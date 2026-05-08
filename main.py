@@ -5,14 +5,17 @@ import anthropic
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from exa_py import Exa
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
+EXA_API_KEY = os.environ.get("EXA_API_KEY")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+exa = Exa(api_key=EXA_API_KEY)
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -27,7 +30,7 @@ def calc_rsi(series, period=14):
 
 def get_technical_signals():
     signals = []
-    symbols = ["SPY", "QQQ", "GLD", "USO", "TLT", "DXY", "BTC-USD", "ETH-USD", "SOL-USD"]
+    symbols = ["SPY", "QQQ", "GLD", "USO", "TLT", "BTC-USD", "ETH-USD", "SOL-USD"]
     for symbol in symbols:
         try:
             df = yf.download(symbol, period="60d", interval="1d", progress=False)
@@ -41,9 +44,7 @@ def get_technical_signals():
             signal_val = signal_line.iloc[-1]
             sma20 = close.rolling(20).mean()
             std20 = close.rolling(20).std()
-            bb_upper = sma20 + 2 * std20
-            bb_lower = sma20 - 2 * std20
-            bb_width = (bb_upper - bb_lower).iloc[-1]
+            bb_width = (4 * std20).iloc[-1]
             price = close.iloc[-1]
             signals.append(f"{symbol}: Price={price:.2f}, RSI={rsi:.1f}, MACD={macd_val:.3f}, Signal={signal_val:.3f}, BB_Width={bb_width:.2f}")
         except:
@@ -60,30 +61,56 @@ def get_yield_curve():
     except:
         return "Yield curve unavailable"
 
-def get_congressional_trades():
-    try:
-        r = requests.get("https://www.quiverquant.com/sources/congresstrading", timeout=5)
-        return "Congressional trading data: check quiverquant.com for latest insider moves"
-    except:
-        return "Congressional data unavailable"
-
-def get_crypto_funding():
-    try:
-        r = requests.get("https://api.coinglass.com/pub/v2/futures/funding_rate?symbol=BTC", timeout=5)
-        data = r.json()
-        if data.get("data"):
-            rate = data["data"][0].get("fundingRate", "N/A")
-            return f"BTC Funding Rate: {rate}"
-    except:
-        pass
-    return "Crypto funding data unavailable"
-
 def get_fear_greed():
     try:
         fear = requests.get("https://api.alternative.me/fng/").json()
         return f"Fear & Greed: {fear['data'][0]['value']} ({fear['data'][0]['value_classification']})"
     except:
         return "Fear & Greed unavailable"
+
+def get_arxiv_signals():
+    try:
+        results = exa.search_and_contents(
+            "quantitative finance trading anomaly alpha signal 2025 2026",
+            num_results=3,
+            include_domains=["arxiv.org"],
+            text={"max_characters": 500}
+        )
+        papers = []
+        for r in results.results:
+            papers.append(f"PAPER: {r.title}\n{r.text[:300]}")
+        return "\n\n".join(papers)
+    except Exception as e:
+        return f"arXiv unavailable: {e}"
+
+def get_market_news():
+    try:
+        results = exa.search_and_contents(
+            "market moving news macro trading today",
+            num_results=5,
+            include_domains=["reuters.com", "bloomberg.com", "ft.com", "wsj.com", "cnbc.com"],
+            text={"max_characters": 300}
+        )
+        news = []
+        for r in results.results:
+            news.append(f"{r.title}: {r.text[:200]}")
+        return "\n\n".join(news)
+    except Exception as e:
+        return f"News unavailable: {e}"
+
+def get_geopolitical_news():
+    try:
+        results = exa.search_and_contents(
+            "Iran Strait of Hormuz oil supply disruption geopolitical risk today",
+            num_results=3,
+            text={"max_characters": 300}
+        )
+        news = []
+        for r in results.results:
+            news.append(f"{r.title}: {r.text[:200]}")
+        return "\n\n".join(news)
+    except Exception as e:
+        return f"Geopolitical news unavailable: {e}"
 
 def ask_misfit(name, persona, signal):
     msg = client.messages.create(
@@ -113,29 +140,33 @@ MISFITS = [
 def run_cycle():
     technical = get_technical_signals()
     yields = get_yield_curve()
-    funding = get_crypto_funding()
     fear = get_fear_greed()
-    congress = get_congressional_trades()
+    arxiv = get_arxiv_signals()
+    news = get_market_news()
+    geo = get_geopolitical_news()
 
-    context = f"""TECHNICAL INDICATORS (9 assets):
+    context = f"""TECHNICAL INDICATORS:
 {technical}
 
 YIELD CURVE:
 {yields}
 
-CRYPTO FUNDING RATES:
-{funding}
-
 SENTIMENT:
 {fear}
 
-CONGRESSIONAL TRADING:
-{congress}"""
+LATEST ARXIV QUANT PAPERS:
+{arxiv}
+
+MARKET NEWS:
+{news}
+
+GEOPOLITICAL NEWS:
+{geo}"""
 
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=1024,
-        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data across equities, bonds, commodities, and crypto. Find genuine anomalies only.
+        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data, live news, and cutting edge academic research. Find genuine anomalies only.
 
 {context}
 
@@ -143,12 +174,11 @@ Rules:
 - RSI below 30 is oversold. RSI above 70 is overbought.
 - MACD crossing above signal line is bullish. Below is bearish.
 - Narrow Bollinger Band width means compression and imminent breakout.
-- Inverted yield curve (negative spread) signals recession risk.
-- Negative crypto funding rate means shorts paying longs -- mean reversion long setup.
-- Only generate a signal if at least two indicators confirm the same direction.
+- Inverted yield curve signals recession risk.
+- Only generate a signal if at least two indicators confirm the same direction AND news supports the thesis.
 - If no genuine anomaly exists say NO SIGNAL and explain why.
 
-Output: Asset, Direction, Entry Zone, Stop, Target, and which indicators confirm."""}]
+Output: Asset, Direction, Entry Zone, Stop, Target, and which indicators plus news confirm."""}]
     )
     signal = yoni.content[0].text
 
