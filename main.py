@@ -2,6 +2,9 @@ import os
 import time
 import requests
 import anthropic
+import yfinance as yf
+import pandas as pd
+import numpy as np
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -15,38 +18,72 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message[:4096]})
 
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 def get_technical_signals():
     signals = []
-    symbols = ["SPY", "QQQ", "GLD", "USO"]
+    symbols = ["SPY", "QQQ", "GLD", "USO", "TLT", "DXY", "BTC-USD", "ETH-USD", "SOL-USD"]
     for symbol in symbols:
         try:
-            rsi = requests.get(f"https://www.alphavantage.co/query?function=RSI&symbol={symbol}&interval=daily&time_period=14&series_type=close&apikey={ALPHA_VANTAGE_API_KEY}").json()
-            rsi_val = list(rsi["Technical Analysis: RSI"].values())[0]["RSI"]
-            macd = requests.get(f"https://www.alphavantage.co/query?function=MACD&symbol={symbol}&interval=daily&series_type=close&apikey={ALPHA_VANTAGE_API_KEY}").json()
-            macd_val = list(macd["Technical Analysis: MACD"].values())[0]
-            bbands = requests.get(f"https://www.alphavantage.co/query?function=BBANDS&symbol={symbol}&interval=daily&time_period=20&series_type=close&apikey={ALPHA_VANTAGE_API_KEY}").json()
-            bb = list(bbands["Technical Analysis: BBANDS"].values())[0]
-            bb_width = float(bb["Real Upper Band"]) - float(bb["Real Lower Band"])
-            signals.append(f"{symbol}: RSI={rsi_val}, MACD={macd_val['MACD']}, Signal={macd_val['MACD_Signal']}, BB_Width={bb_width:.2f}")
+            df = yf.download(symbol, period="60d", interval="1d", progress=False)
+            close = df["Close"].squeeze()
+            rsi = calc_rsi(close).iloc[-1]
+            ema12 = close.ewm(span=12).mean()
+            ema26 = close.ewm(span=26).mean()
+            macd = ema12 - ema26
+            signal_line = macd.ewm(span=9).mean()
+            macd_val = macd.iloc[-1]
+            signal_val = signal_line.iloc[-1]
+            sma20 = close.rolling(20).mean()
+            std20 = close.rolling(20).std()
+            bb_upper = sma20 + 2 * std20
+            bb_lower = sma20 - 2 * std20
+            bb_width = (bb_upper - bb_lower).iloc[-1]
+            price = close.iloc[-1]
+            signals.append(f"{symbol}: Price={price:.2f}, RSI={rsi:.1f}, MACD={macd_val:.3f}, Signal={signal_val:.3f}, BB_Width={bb_width:.2f}")
         except:
             pass
     return "\n".join(signals)
 
-def get_market_data():
-    data = []
+def get_yield_curve():
     try:
-        crypto = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true").json()
-        data.append(f"BTC: ${crypto['bitcoin']['usd']} ({crypto['bitcoin']['usd_24h_change']:.1f}%)")
-        data.append(f"ETH: ${crypto['ethereum']['usd']} ({crypto['ethereum']['usd_24h_change']:.1f}%)")
-        data.append(f"SOL: ${crypto['solana']['usd']} ({crypto['solana']['usd_24h_change']:.1f}%)")
+        t2 = yf.download("^IRX", period="5d", progress=False)["Close"].iloc[-1].item()
+        t10 = yf.download("^TNX", period="5d", progress=False)["Close"].iloc[-1].item()
+        t30 = yf.download("^TYX", period="5d", progress=False)["Close"].iloc[-1].item()
+        spread = t10 - t2
+        return f"2Y={t2:.2f}% 10Y={t10:.2f}% 30Y={t30:.2f}% Spread(10-2)={spread:.2f}%"
+    except:
+        return "Yield curve unavailable"
+
+def get_congressional_trades():
+    try:
+        r = requests.get("https://www.quiverquant.com/sources/congresstrading", timeout=5)
+        return "Congressional trading data: check quiverquant.com for latest insider moves"
+    except:
+        return "Congressional data unavailable"
+
+def get_crypto_funding():
+    try:
+        r = requests.get("https://api.coinglass.com/pub/v2/futures/funding_rate?symbol=BTC", timeout=5)
+        data = r.json()
+        if data.get("data"):
+            rate = data["data"][0].get("fundingRate", "N/A")
+            return f"BTC Funding Rate: {rate}"
     except:
         pass
+    return "Crypto funding data unavailable"
+
+def get_fear_greed():
     try:
         fear = requests.get("https://api.alternative.me/fng/").json()
-        data.append(f"Fear & Greed: {fear['data'][0]['value']} ({fear['data'][0]['value_classification']})")
+        return f"Fear & Greed: {fear['data'][0]['value']} ({fear['data'][0]['value_classification']})"
     except:
-        pass
-    return "\n".join(data)
+        return "Fear & Greed unavailable"
 
 def ask_misfit(name, persona, signal):
     msg = client.messages.create(
@@ -75,25 +112,41 @@ MISFITS = [
 
 def run_cycle():
     technical = get_technical_signals()
-    market = get_market_data()
+    yields = get_yield_curve()
+    funding = get_crypto_funding()
+    fear = get_fear_greed()
+    congress = get_congressional_trades()
+
+    context = f"""TECHNICAL INDICATORS (9 assets):
+{technical}
+
+YIELD CURVE:
+{yields}
+
+CRYPTO FUNDING RATES:
+{funding}
+
+SENTIMENT:
+{fear}
+
+CONGRESSIONAL TRADING:
+{congress}"""
 
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=1024,
-        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data. Analyze it and identify genuine anomalies only.
+        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data across equities, bonds, commodities, and crypto. Find genuine anomalies only.
 
-TECHNICAL INDICATORS:
-{technical}
-
-MARKET DATA:
-{market}
+{context}
 
 Rules:
 - RSI below 30 is oversold. RSI above 70 is overbought.
 - MACD crossing above signal line is bullish. Below is bearish.
-- Narrow Bollinger Band width means compression. Breakout coming.
+- Narrow Bollinger Band width means compression and imminent breakout.
+- Inverted yield curve (negative spread) signals recession risk.
+- Negative crypto funding rate means shorts paying longs -- mean reversion long setup.
 - Only generate a signal if at least two indicators confirm the same direction.
-- If no genuine anomaly exists, say NO SIGNAL and explain why.
+- If no genuine anomaly exists say NO SIGNAL and explain why.
 
 Output: Asset, Direction, Entry Zone, Stop, Target, and which indicators confirm."""}]
     )
