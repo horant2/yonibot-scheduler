@@ -50,26 +50,24 @@ def get_positions():
 def close_position(symbol):
     return alpaca_request("DELETE", f"/v2/positions/{symbol}")
 
-def submit_order(symbol, qty, side, stop_price=None):
-    order = {
+def submit_order(symbol, qty, side):
+    return alpaca_request("POST", "/v2/orders", {
         "symbol": symbol,
         "qty": qty,
         "side": side,
         "type": "market",
         "time_in_force": "day"
-    }
-    return alpaca_request("POST", "/v2/orders", order)
+    })
 
 def submit_stop_loss(symbol, qty, side, stop_price):
-    order = {
+    return alpaca_request("POST", "/v2/orders", {
         "symbol": symbol,
         "qty": qty,
         "side": side,
         "type": "stop",
         "stop_price": str(round(stop_price, 2)),
         "time_in_force": "gtc"
-    }
-    return alpaca_request("POST", "/v2/orders", order)
+    })
 
 def calc_rsi(series, period=14):
     delta = series.diff()
@@ -162,6 +160,19 @@ def get_geopolitical_news():
     except Exception as e:
         return f"Geopolitical news unavailable: {e}"
 
+def get_position_size(vote_count, buying_power):
+    if vote_count == 5:
+        pct = 0.10
+        label = "MAXIMUM CONVICTION -- 10% of book"
+    elif vote_count == 4:
+        pct = 0.08
+        label = "HIGH CONVICTION -- 8% of book"
+    else:
+        pct = 0.05
+        label = "BASE CONVICTION -- 5% of book"
+    size = min(buying_power * pct, 10000)
+    return size, label
+
 def check_stop_losses():
     try:
         positions = get_positions()
@@ -170,8 +181,6 @@ def check_stop_losses():
         closed = []
         for pos in positions:
             symbol = pos["symbol"]
-            qty = abs(int(float(pos["qty"])))
-            entry_price = float(pos["avg_entry_price"])
             current_price = float(pos["current_price"])
             side = pos["side"]
             unrealized_pnl_pct = float(pos["unrealized_plpc"]) * 100
@@ -204,7 +213,7 @@ def extract_direction(signal):
         return "buy"
     return None
 
-def execute_trade(signal):
+def execute_trade(signal, vote_count):
     try:
         ticker = extract_ticker(signal)
         direction = extract_direction(signal)
@@ -212,7 +221,7 @@ def execute_trade(signal):
             return "No executable equity trade identified."
         account = get_account()
         buying_power = float(account["buying_power"])
-        position_size = min(buying_power * 0.05, 5000)
+        position_size, size_label = get_position_size(vote_count, buying_power)
         price_data = yf.download(ticker, period="1d", interval="1m", progress=False)
         price = float(price_data["Close"].squeeze().iloc[-1])
         qty = max(1, int(position_size / price))
@@ -221,7 +230,7 @@ def execute_trade(signal):
         stop_side = "sell" if direction == "buy" else "buy"
         stop_price = price * 0.95 if direction == "buy" else price * 1.05
         submit_stop_loss(ticker, qty, stop_side, stop_price)
-        return f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}. Stop at ${stop_price:.2f}. Order ID: {order_id}"
+        return f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}\nSize: {size_label}\nStop: ${stop_price:.2f}\nOrder ID: {order_id}"
     except Exception as e:
         return f"Trade execution failed: {e}"
 
@@ -311,7 +320,7 @@ Rules:
     majority = vote_count >= 3
 
     if majority and approved:
-        trade_result = execute_trade(signal)
+        trade_result = execute_trade(signal, vote_count)
         verdict_line = f"VERDICT: EXECUTE -- {vote_count}/5 voted TRADE. Jane Street approved.\n{trade_result}"
     elif not approved:
         verdict_line = f"VERDICT: BLOCKED -- Jane Street vetoed. ({vote_count}/5 voted TRADE)"
