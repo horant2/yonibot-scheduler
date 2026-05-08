@@ -6,6 +6,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from exa_py import Exa
+import alpaca_trade_api as tradeapi
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -13,9 +14,13 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
 EXA_API_KEY = os.environ.get("EXA_API_KEY")
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 exa = Exa(api_key=EXA_API_KEY)
+alpaca = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -115,6 +120,47 @@ def get_geopolitical_news():
     except Exception as e:
         return f"Geopolitical news unavailable: {e}"
 
+def extract_ticker(signal):
+    equity_map = {
+        "QQQ": "QQQ", "SPY": "SPY", "GLD": "GLD",
+        "USO": "USO", "TLT": "TLT"
+    }
+    for ticker in equity_map:
+        if ticker in signal:
+            return ticker
+    return None
+
+def extract_direction(signal):
+    signal_upper = signal.upper()
+    if "SHORT" in signal_upper:
+        return "sell"
+    if "LONG" in signal_upper or "BUY" in signal_upper:
+        return "buy"
+    return None
+
+def execute_trade(signal):
+    try:
+        ticker = extract_ticker(signal)
+        direction = extract_direction(signal)
+        if not ticker or not direction:
+            return "No executable equity trade identified."
+        account = alpaca.get_account()
+        buying_power = float(account.buying_power)
+        position_size = min(buying_power * 0.05, 5000)
+        quote = alpaca.get_latest_trade(ticker)
+        price = quote.price
+        qty = max(1, int(position_size / price))
+        order = alpaca.submit_order(
+            symbol=ticker,
+            qty=qty,
+            side=direction,
+            type="market",
+            time_in_force="day"
+        )
+        return f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}. Order ID: {order.id}"
+    except Exception as e:
+        return f"Trade execution failed: {e}"
+
 def ask_misfit(name, persona, signal):
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
@@ -181,8 +227,7 @@ Rules:
 - Only generate a signal if at least two indicators confirm the same direction AND news supports the thesis.
 - If no genuine anomaly exists say NO SIGNAL and explain why.
 - Keep output concise: Asset, Direction, Entry Zone, Stop, Target, confirming indicators only.
-
-Output maximum 300 words."""}]
+- Output maximum 300 words."""}]
     )
     signal = yoni.content[0].text
 
@@ -200,18 +245,17 @@ Output maximum 300 words."""}]
     majority = vote_count >= 3
 
     if majority and approved:
-        verdict_line = f"VERDICT: EXECUTE -- {vote_count}/5 voted TRADE. Jane Street approved."
+        trade_result = execute_trade(signal)
+        verdict_line = f"VERDICT: EXECUTE -- {vote_count}/5 voted TRADE. Jane Street approved.\n{trade_result}"
     elif not approved:
         verdict_line = f"VERDICT: BLOCKED -- Jane Street vetoed. ({vote_count}/5 voted TRADE)"
     else:
         verdict_line = f"VERDICT: PASS -- Only {vote_count}/5 voted TRADE. No majority."
 
     msg1 = f"YONIBOT SIGNAL\n{signal}"
-    
     msg2 = "THE MISFITS DEBATE\n"
     for name, verdict in verdicts:
         msg2 += f"\n{name.upper()}:\n{verdict}\n"
-    
     msg3 = f"JANE STREET:\n{jane}\n\n{verdict_line}"
 
     send_telegram(msg1)
