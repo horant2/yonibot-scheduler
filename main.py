@@ -38,18 +38,38 @@ def alpaca_request(method, endpoint, data=None):
         return requests.get(url, headers=headers).json()
     elif method == "POST":
         return requests.post(url, headers=headers, json=data).json()
+    elif method == "DELETE":
+        return requests.delete(url, headers=headers).json()
 
 def get_account():
     return alpaca_request("GET", "/v2/account")
 
-def submit_order(symbol, qty, side):
-    return alpaca_request("POST", "/v2/orders", {
+def get_positions():
+    return alpaca_request("GET", "/v2/positions")
+
+def close_position(symbol):
+    return alpaca_request("DELETE", f"/v2/positions/{symbol}")
+
+def submit_order(symbol, qty, side, stop_price=None):
+    order = {
         "symbol": symbol,
         "qty": qty,
         "side": side,
         "type": "market",
         "time_in_force": "day"
-    })
+    }
+    return alpaca_request("POST", "/v2/orders", order)
+
+def submit_stop_loss(symbol, qty, side, stop_price):
+    order = {
+        "symbol": symbol,
+        "qty": qty,
+        "side": side,
+        "type": "stop",
+        "stop_price": str(round(stop_price, 2)),
+        "time_in_force": "gtc"
+    }
+    return alpaca_request("POST", "/v2/orders", order)
 
 def calc_rsi(series, period=14):
     delta = series.diff()
@@ -142,6 +162,34 @@ def get_geopolitical_news():
     except Exception as e:
         return f"Geopolitical news unavailable: {e}"
 
+def check_stop_losses():
+    try:
+        positions = get_positions()
+        if not isinstance(positions, list):
+            return
+        closed = []
+        for pos in positions:
+            symbol = pos["symbol"]
+            qty = abs(int(float(pos["qty"])))
+            entry_price = float(pos["avg_entry_price"])
+            current_price = float(pos["current_price"])
+            side = pos["side"]
+            unrealized_pnl_pct = float(pos["unrealized_plpc"]) * 100
+            stop_triggered = False
+            if side == "long" and unrealized_pnl_pct <= -5:
+                stop_triggered = True
+                close_side = "sell"
+            elif side == "short" and unrealized_pnl_pct <= -5:
+                stop_triggered = True
+                close_side = "buy"
+            if stop_triggered:
+                close_position(symbol)
+                closed.append(f"STOP LOSS: Closed {symbol} at ${current_price:.2f}. Loss: {unrealized_pnl_pct:.1f}%")
+        if closed:
+            send_telegram("STOP LOSS TRIGGERED\n" + "\n".join(closed))
+    except Exception as e:
+        print(f"Stop loss check error: {e}")
+
 def extract_ticker(signal):
     for ticker in ["QQQ", "SPY", "GLD", "USO", "TLT"]:
         if ticker in signal:
@@ -170,7 +218,10 @@ def execute_trade(signal):
         qty = max(1, int(position_size / price))
         order = submit_order(ticker, qty, direction)
         order_id = order.get("id", "unknown")
-        return f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}. Order ID: {order_id}"
+        stop_side = "sell" if direction == "buy" else "buy"
+        stop_price = price * 0.95 if direction == "buy" else price * 1.05
+        submit_stop_loss(ticker, qty, stop_side, stop_price)
+        return f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}. Stop at ${stop_price:.2f}. Order ID: {order_id}"
     except Exception as e:
         return f"Trade execution failed: {e}"
 
@@ -200,6 +251,8 @@ MISFITS = [
 ]
 
 def run_cycle():
+    check_stop_losses()
+
     technical = get_technical_signals()
     yields = get_yield_curve()
     fear = get_fear_greed()
