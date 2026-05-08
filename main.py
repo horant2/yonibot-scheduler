@@ -6,7 +6,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from exa_py import Exa
-import alpaca_trade_api as tradeapi
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -20,7 +19,6 @@ ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 exa = Exa(api_key=EXA_API_KEY)
-alpaca = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -28,6 +26,30 @@ def send_telegram(message):
     for chunk in chunks:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk})
         time.sleep(1)
+
+def alpaca_request(method, endpoint, data=None):
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        "Content-Type": "application/json"
+    }
+    url = f"{ALPACA_BASE_URL}{endpoint}"
+    if method == "GET":
+        return requests.get(url, headers=headers).json()
+    elif method == "POST":
+        return requests.post(url, headers=headers, json=data).json()
+
+def get_account():
+    return alpaca_request("GET", "/v2/account")
+
+def submit_order(symbol, qty, side):
+    return alpaca_request("POST", "/v2/orders", {
+        "symbol": symbol,
+        "qty": qty,
+        "side": side,
+        "type": "market",
+        "time_in_force": "day"
+    })
 
 def calc_rsi(series, period=14):
     delta = series.diff()
@@ -121,11 +143,7 @@ def get_geopolitical_news():
         return f"Geopolitical news unavailable: {e}"
 
 def extract_ticker(signal):
-    equity_map = {
-        "QQQ": "QQQ", "SPY": "SPY", "GLD": "GLD",
-        "USO": "USO", "TLT": "TLT"
-    }
-    for ticker in equity_map:
+    for ticker in ["QQQ", "SPY", "GLD", "USO", "TLT"]:
         if ticker in signal:
             return ticker
     return None
@@ -144,20 +162,15 @@ def execute_trade(signal):
         direction = extract_direction(signal)
         if not ticker or not direction:
             return "No executable equity trade identified."
-        account = alpaca.get_account()
-        buying_power = float(account.buying_power)
+        account = get_account()
+        buying_power = float(account["buying_power"])
         position_size = min(buying_power * 0.05, 5000)
-        quote = alpaca.get_latest_trade(ticker)
-        price = quote.price
+        price_data = yf.download(ticker, period="1d", interval="1m", progress=False)
+        price = float(price_data["Close"].iloc[-1])
         qty = max(1, int(position_size / price))
-        order = alpaca.submit_order(
-            symbol=ticker,
-            qty=qty,
-            side=direction,
-            type="market",
-            time_in_force="day"
-        )
-        return f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}. Order ID: {order.id}"
+        order = submit_order(ticker, qty, direction)
+        order_id = order.get("id", "unknown")
+        return f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}. Order ID: {order_id}"
     except Exception as e:
         return f"Trade execution failed: {e}"
 
