@@ -4,4 +4,4 @@ yfinance
 pandas
 numpy
 exa-py
-alpaca-trade-api
+
