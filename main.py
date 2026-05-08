@@ -6,9 +6,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from exa_py import Exa
+from datetime import datetime
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_PERFORMANCE_TOKEN = os.environ.get("TELEGRAM_PERFORMANCE_TOKEN")
+TELEGRAM_PERFORMANCE_CHAT_ID = os.environ.get("TELEGRAM_PERFORMANCE_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
@@ -25,6 +28,13 @@ def send_telegram(message):
     chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
     for chunk in chunks:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk})
+        time.sleep(1)
+
+def send_performance(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_PERFORMANCE_TOKEN}/sendMessage"
+    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
+    for chunk in chunks:
+        requests.post(url, json={"chat_id": TELEGRAM_PERFORMANCE_CHAT_ID, "text": chunk})
         time.sleep(1)
 
 def alpaca_request(method, endpoint, data=None):
@@ -206,11 +216,31 @@ def check_stop_losses():
                 stop_triggered = True
             if stop_triggered:
                 close_position(symbol)
-                closed.append(f"STOP LOSS: Closed {symbol} at ${current_price:.2f}. Loss: {unrealized_pnl_pct:.1f}%")
+                msg = f"STOP LOSS HIT\nSymbol: {symbol}\nPrice: ${current_price:.2f}\nLoss: {unrealized_pnl_pct:.1f}%\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+                closed.append(msg)
+                send_performance(msg)
         if closed:
             send_telegram("STOP LOSS TRIGGERED\n" + "\n".join(closed))
     except Exception as e:
         print(f"Stop loss check error: {e}")
+
+def report_open_positions():
+    try:
+        positions = get_positions()
+        if not isinstance(positions, list) or len(positions) == 0:
+            return
+        report = f"OPEN POSITIONS -- {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+        for pos in positions:
+            symbol = pos["symbol"]
+            qty = pos["qty"]
+            entry = float(pos["avg_entry_price"])
+            current = float(pos["current_price"])
+            pnl_pct = float(pos["unrealized_plpc"]) * 100
+            pnl_dollar = float(pos["unrealized_pl"])
+            report += f"{symbol}: {qty} shares\nEntry: ${entry:.2f} | Now: ${current:.2f}\nP&L: ${pnl_dollar:.2f} ({pnl_pct:.1f}%)\n\n"
+        send_performance(report)
+    except Exception as e:
+        print(f"Position report error: {e}")
 
 def extract_ticker(signal):
     for ticker in ["QQQ", "SPY", "GLD", "USO", "TLT"]:
@@ -243,7 +273,10 @@ def execute_trade(signal, vote_count):
         stop_side = "sell" if direction == "buy" else "buy"
         stop_price = price * 0.95 if direction == "buy" else price * 1.05
         submit_stop_loss(ticker, qty, stop_side, stop_price)
-        return f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}\nSize: {size_label}\nStop: ${stop_price:.2f}\nOrder ID: {order_id}"
+        result = f"TRADE EXECUTED: {direction.upper()} {qty} shares of {ticker} at ~${price:.2f}\nSize: {size_label}\nStop: ${stop_price:.2f}\nOrder ID: {order_id}"
+        perf_log = f"NEW TRADE LOGGED\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\nAsset: {ticker}\nDirection: {direction.upper()}\nEntry: ${price:.2f}\nQty: {qty}\nSize: {size_label}\nStop: ${stop_price:.2f}\nVotes: {vote_count}/5\nOrder ID: {order_id}"
+        send_performance(perf_log)
+        return result
     except Exception as e:
         return f"Trade execution failed: {e}"
 
@@ -272,8 +305,16 @@ MISFITS = [
     ("Andurand", "You ARE Pierre Andurand. What does this mean for physical commodity flows and geopolitical supply disruption?"),
 ]
 
+cycle_count = 0
+
 def run_cycle():
+    global cycle_count
+    cycle_count += 1
+
     check_stop_losses()
+
+    if cycle_count % 4 == 0:
+        report_open_positions()
 
     technical = get_technical_signals()
     yields = get_yield_curve()
@@ -316,7 +357,7 @@ Rules:
 - MACD crossing above signal line is bullish. Below is bearish.
 - Narrow Bollinger Band width means compression and imminent breakout.
 - Inverted yield curve signals recession risk.
-- Congressional buying in a sector is a leading indicator -- politicians have information advantage.
+- Congressional buying in a sector is a leading indicator.
 - Only generate a signal if at least two indicators confirm the same direction AND news or congressional activity supports the thesis.
 - If no genuine anomaly exists say NO SIGNAL and explain why.
 - Keep output concise: Asset, Direction, Entry Zone, Stop, Target, confirming indicators only.
