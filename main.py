@@ -79,6 +79,23 @@ def submit_stop_loss(symbol, qty, side, stop_price):
         "time_in_force": "gtc"
     })
 
+def keepalive():
+    try:
+        get_account()
+        print(f"Keepalive ping {datetime.utcnow().strftime('%H:%M:%S')}")
+    except:
+        pass
+
+def smart_sleep(total_seconds):
+    interval = 480
+    elapsed = 0
+    while elapsed < total_seconds:
+        sleep_chunk = min(interval, total_seconds - elapsed)
+        time.sleep(sleep_chunk)
+        elapsed += sleep_chunk
+        if elapsed < total_seconds:
+            keepalive()
+
 def calc_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
@@ -185,6 +202,20 @@ def get_congressional_trading():
     except Exception as e:
         return f"Congressional trading unavailable: {e}"
 
+def get_misfit_knowledge(name, trader_query):
+    try:
+        results = exa.search_and_contents(
+            trader_query,
+            num_results=3,
+            text={"max_characters": 400}
+        )
+        knowledge = []
+        for r in results.results:
+            knowledge.append(f"{r.title}: {r.text[:300]}")
+        return "\n\n".join(knowledge)
+    except:
+        return ""
+
 def get_position_size(vote_count, buying_power):
     if vote_count == 5:
         pct = 0.10
@@ -280,11 +311,12 @@ def execute_trade(signal, vote_count):
     except Exception as e:
         return f"Trade execution failed: {e}"
 
-def ask_misfit(name, persona, signal):
+def ask_misfit(name, persona, signal, extra_knowledge=""):
+    knowledge_context = f"\n\nRECENT RESEARCH ON YOUR TRADING STYLE:\n{extra_knowledge}" if extra_knowledge else ""
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=400,
-        messages=[{"role": "user", "content": f"{persona}\n\nYoniBot signal:\n{signal}\n\nGive your verdict in 2-3 sentences maximum. Be brutal and direct. End with either VOTE: TRADE or VOTE: PASS on its own line."}]
+        messages=[{"role": "user", "content": f"{persona}{knowledge_context}\n\nYoniBot signal:\n{signal}\n\nGive your verdict in 2-3 sentences maximum. Be brutal and direct. End with either VOTE: TRADE or VOTE: PASS on its own line."}]
     )
     return msg.content[0].text
 
@@ -298,23 +330,51 @@ def ask_jane_street(signal, verdicts):
     return msg.content[0].text
 
 MISFITS = [
-    ("Soros", "You ARE George Soros. Find the hidden peg. Where is the lie everyone believes and when does it break?"),
-    ("Druckenmiller", "You ARE Stanley Druckenmiller. State your stop level, your target, and your conviction size."),
-    ("PTJ", "You ARE Paul Tudor Jones. Does a 5 to 1 risk/reward setup exist? Where is the stop?"),
-    ("Tepper", "You ARE David Tepper. Is the Fed with us or against us on this trade? What are congressional insiders doing?"),
-    ("Andurand", "You ARE Pierre Andurand. What does this mean for physical commodity flows and geopolitical supply disruption?"),
+    (
+        "Soros",
+        "You ARE George Soros. You broke the Bank of England on Black Wednesday 1992 by identifying the lie that the British pound could hold its peg. Find the hidden peg in every market. Where is the lie everyone believes and when do the defenders run out of ammunition?",
+        "George Soros Black Wednesday 1992 pound sterling ERM trade reflexivity biggest win interview"
+    ),
+    (
+        "Druckenmiller",
+        "You ARE Stanley Druckenmiller. You called the Deutsche Mark collapse alongside Soros and doubled the position. You think about what you can lose before what you can make. State your stop level first, then your target, then your conviction size.",
+        "Stanley Druckenmiller biggest trade win asymmetric bet risk management interview Ira Sohn"
+    ),
+    (
+        "PTJ",
+        "You ARE Paul Tudor Jones. You called Black Monday 1987 by studying 1929 patterns. You never get out of bed for less than 5 to 1 risk reward. Does a 5 to 1 setup exist here? Where is the hard stop?",
+        "Paul Tudor Jones Black Monday 1987 prediction trading rules risk management documentary interview"
+    ),
+    (
+        "Tepper",
+        "You ARE David Tepper. You made 7 billion dollars in 2009 buying bank bonds when everyone thought the system was ending because you read the government would not let banks fail. Read the policy backdrop. Is the Fed with us or against us?",
+        "David Tepper 2009 bank trade Appaloosa biggest win Fed policy interview CNBC"
+    ),
+    (
+        "Andurand",
+        "You ARE Pierre Andurand. You called the 2008 oil spike, the 2014 crash, and the 2022 Russia Ukraine energy crisis by tracking physical flows before they showed in price. Read tanker movements, refinery margins, and geopolitical chokepoints. What does the physical world say?",
+        "Pierre Andurand oil trade 2008 2022 biggest win physical commodity flows interview letter"
+    ),
 ]
 
 cycle_count = 0
+misfit_knowledge_cache = {}
+knowledge_refresh_cycles = 8
 
 def run_cycle():
-    global cycle_count
+    global cycle_count, misfit_knowledge_cache
     cycle_count += 1
 
     check_stop_losses()
 
     if cycle_count % 4 == 0:
         report_open_positions()
+
+    if cycle_count % knowledge_refresh_cycles == 1:
+        print("Refreshing Misfit knowledge bases...")
+        for name, persona, query in MISFITS:
+            misfit_knowledge_cache[name] = get_misfit_knowledge(name, query)
+            time.sleep(2)
 
     technical = get_technical_signals()
     yields = get_yield_curve()
@@ -368,8 +428,9 @@ Rules:
     verdicts = []
     vote_count = 0
 
-    for name, persona in MISFITS:
-        verdict = ask_misfit(name, persona, signal)
+    for name, persona, query in MISFITS:
+        knowledge = misfit_knowledge_cache.get(name, "")
+        verdict = ask_misfit(name, persona, signal, knowledge)
         verdicts.append((name, verdict))
         if "VOTE: TRADE" in verdict:
             vote_count += 1
@@ -399,10 +460,13 @@ Rules:
     send_telegram(msg3)
     print(f"Brief sent. {verdict_line}")
 
+    smart_sleep(900)
+
 while True:
     try:
         run_cycle()
     except Exception as e:
         send_telegram(f"Misfits error: {e}")
         print(f"Error: {e}")
-    time.sleep(900)
+        smart_sleep(900)
+        
