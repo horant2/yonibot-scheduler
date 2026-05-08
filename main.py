@@ -7,6 +7,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY")
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -14,22 +15,37 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message[:4096]})
 
-def get_market_data():
-    symbols = ["SPY", "QQQ", "GLD", "USO", "BTC-USD"]
-    data = []
+def get_technical_signals():
+    signals = []
+    symbols = ["SPY", "QQQ", "GLD", "USO"]
     for symbol in symbols:
         try:
-            r = requests.get(f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}")
-            q = r.json()
-            data.append(f"{symbol}: price={q.get('c')}, change={q.get('dp')}%")
+            rsi = requests.get(f"https://www.alphavantage.co/query?function=RSI&symbol={symbol}&interval=daily&time_period=14&series_type=close&apikey={ALPHA_VANTAGE_API_KEY}").json()
+            rsi_val = list(rsi["Technical Analysis: RSI"].values())[0]["RSI"]
+            macd = requests.get(f"https://www.alphavantage.co/query?function=MACD&symbol={symbol}&interval=daily&series_type=close&apikey={ALPHA_VANTAGE_API_KEY}").json()
+            macd_val = list(macd["Technical Analysis: MACD"].values())[0]
+            bbands = requests.get(f"https://www.alphavantage.co/query?function=BBANDS&symbol={symbol}&interval=daily&time_period=20&series_type=close&apikey={ALPHA_VANTAGE_API_KEY}").json()
+            bb = list(bbands["Technical Analysis: BBANDS"].values())[0]
+            bb_width = float(bb["Real Upper Band"]) - float(bb["Real Lower Band"])
+            signals.append(f"{symbol}: RSI={rsi_val}, MACD={macd_val['MACD']}, Signal={macd_val['MACD_Signal']}, BB_Width={bb_width:.2f}")
         except:
             pass
-    crypto = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true").json()
-    data.append(f"BTC: ${crypto['bitcoin']['usd']} ({crypto['bitcoin']['usd_24h_change']:.1f}%)")
-    data.append(f"ETH: ${crypto['ethereum']['usd']} ({crypto['ethereum']['usd_24h_change']:.1f}%)")
-    data.append(f"SOL: ${crypto['solana']['usd']} ({crypto['solana']['usd_24h_change']:.1f}%)")
-    fear = requests.get("https://api.alternative.me/fng/").json()
-    data.append(f"Fear & Greed: {fear['data'][0]['value']} ({fear['data'][0]['value_classification']})")
+    return "\n".join(signals)
+
+def get_market_data():
+    data = []
+    try:
+        crypto = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true").json()
+        data.append(f"BTC: ${crypto['bitcoin']['usd']} ({crypto['bitcoin']['usd_24h_change']:.1f}%)")
+        data.append(f"ETH: ${crypto['ethereum']['usd']} ({crypto['ethereum']['usd_24h_change']:.1f}%)")
+        data.append(f"SOL: ${crypto['solana']['usd']} ({crypto['solana']['usd_24h_change']:.1f}%)")
+    except:
+        pass
+    try:
+        fear = requests.get("https://api.alternative.me/fng/").json()
+        data.append(f"Fear & Greed: {fear['data'][0]['value']} ({fear['data'][0]['value_classification']})")
+    except:
+        pass
     return "\n".join(data)
 
 def ask_misfit(name, persona, signal):
@@ -58,12 +74,28 @@ MISFITS = [
 ]
 
 def run_cycle():
-    market_data = get_market_data()
+    technical = get_technical_signals()
+    market = get_market_data()
 
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=1024,
-        messages=[{"role": "user", "content": f"You are YoniBot. Here is live market data:\n{market_data}\n\nAlso scan arXiv q-fin papers for tradeable anomalies. Output a concise trade signal with asset, direction, entry zone, stop, and target."}]
+        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data. Analyze it and identify genuine anomalies only.
+
+TECHNICAL INDICATORS:
+{technical}
+
+MARKET DATA:
+{market}
+
+Rules:
+- RSI below 30 is oversold. RSI above 70 is overbought.
+- MACD crossing above signal line is bullish. Below is bearish.
+- Narrow Bollinger Band width means compression. Breakout coming.
+- Only generate a signal if at least two indicators confirm the same direction.
+- If no genuine anomaly exists, say NO SIGNAL and explain why.
+
+Output: Asset, Direction, Entry Zone, Stop, Target, and which indicators confirm."""}]
     )
     signal = yoni.content[0].text
 
