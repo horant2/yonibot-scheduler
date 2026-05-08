@@ -19,7 +19,10 @@ exa = Exa(api_key=EXA_API_KEY)
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message[:4096]})
+    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
+    for chunk in chunks:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk})
+        time.sleep(1)
 
 def calc_rsi(series, period=14):
     delta = series.diff()
@@ -115,8 +118,8 @@ def get_geopolitical_news():
 def ask_misfit(name, persona, signal):
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
-        max_tokens=512,
-        messages=[{"role": "user", "content": f"{persona}\n\nYoniBot signal:\n{signal}\n\nGive your verdict in 3-5 sentences. End your response with either VOTE: TRADE or VOTE: PASS on its own line."}]
+        max_tokens=400,
+        messages=[{"role": "user", "content": f"{persona}\n\nYoniBot signal:\n{signal}\n\nGive your verdict in 2-3 sentences maximum. Be brutal and direct. End with either VOTE: TRADE or VOTE: PASS on its own line."}]
     )
     return msg.content[0].text
 
@@ -124,16 +127,16 @@ def ask_jane_street(signal, verdicts):
     debate = "\n\n".join([f"{n}:\n{v}" for n, v in verdicts])
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
-        max_tokens=512,
-        messages=[{"role": "user", "content": f"You ARE Jane Street quant engine. The Misfits have debated this signal.\n\nSIGNAL:\n{signal}\n\nDEBATE:\n{debate}\n\nCalculate edge, Kelly size, and max drawdown. You have veto power. End with either VETO: BLOCKED or VETO: APPROVED on its own line."}]
+        max_tokens=400,
+        messages=[{"role": "user", "content": f"You ARE Jane Street quant engine. The Misfits have debated this signal.\n\nSIGNAL:\n{signal}\n\nDEBATE:\n{debate}\n\nCalculate edge, Kelly size, and max drawdown in 2-3 sentences. You have veto power. End with either VETO: BLOCKED or VETO: APPROVED on its own line."}]
     )
     return msg.content[0].text
 
 MISFITS = [
     ("Soros", "You ARE George Soros. Find the hidden peg. Where is the lie everyone believes and when does it break?"),
     ("Druckenmiller", "You ARE Stanley Druckenmiller. State your stop level, your target, and your conviction size."),
-    ("PTJ", "You ARE Paul Tudor Jones. Check the chart pattern. Does a 5 to 1 risk/reward setup exist? Where is the stop?"),
-    ("Tepper", "You ARE David Tepper. Read the policy backdrop. Is the Fed with us or against us on this trade?"),
+    ("PTJ", "You ARE Paul Tudor Jones. Does a 5 to 1 risk/reward setup exist? Where is the stop?"),
+    ("Tepper", "You ARE David Tepper. Is the Fed with us or against us on this trade?"),
     ("Andurand", "You ARE Pierre Andurand. What does this mean for physical commodity flows and geopolitical supply disruption?"),
 ]
 
@@ -177,25 +180,22 @@ Rules:
 - Inverted yield curve signals recession risk.
 - Only generate a signal if at least two indicators confirm the same direction AND news supports the thesis.
 - If no genuine anomaly exists say NO SIGNAL and explain why.
+- Keep output concise: Asset, Direction, Entry Zone, Stop, Target, confirming indicators only.
 
-Output: Asset, Direction, Entry Zone, Stop, Target, and which indicators plus news confirm."""}]
+Output maximum 300 words."""}]
     )
     signal = yoni.content[0].text
 
     verdicts = []
     vote_count = 0
-    brief = f"YONIBOT SIGNAL\n{signal}\n\nTHE MISFITS DEBATE\n"
 
     for name, persona in MISFITS:
         verdict = ask_misfit(name, persona, signal)
         verdicts.append((name, verdict))
-        brief += f"\n{name.upper()}:\n{verdict}\n"
         if "VOTE: TRADE" in verdict:
             vote_count += 1
 
     jane = ask_jane_street(signal, verdicts)
-    brief += f"\nJANE STREET:\n{jane}\n"
-
     approved = "VETO: APPROVED" in jane
     majority = vote_count >= 3
 
@@ -206,8 +206,19 @@ Output: Asset, Direction, Entry Zone, Stop, Target, and which indicators plus ne
     else:
         verdict_line = f"VERDICT: PASS -- Only {vote_count}/5 voted TRADE. No majority."
 
-    brief += f"\n{verdict_line}"
-    send_telegram(brief)
+    msg1 = f"YONIBOT SIGNAL\n{signal}"
+    
+    msg2 = "THE MISFITS DEBATE\n"
+    for name, verdict in verdicts:
+        msg2 += f"\n{name.upper()}:\n{verdict}\n"
+    
+    msg3 = f"JANE STREET:\n{jane}\n\n{verdict_line}"
+
+    send_telegram(msg1)
+    time.sleep(2)
+    send_telegram(msg2)
+    time.sleep(2)
+    send_telegram(msg3)
     print(f"Brief sent. {verdict_line}")
 
 while True:
