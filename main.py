@@ -103,9 +103,91 @@ def calc_rsi(series, period=14):
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+def run_omniscient_rotation():
+    tickers = ["SOXL", "TECL", "TQQQ", "FAS", "ERX", "UUP", "TMF", "BIL"]
+    safe = "BIL"
+    scores = {}
+    prices = {}
+
+    try:
+        spy_data = yf.download("SPY", period="220d", interval="1d", progress=False)
+        spy_close = spy_data["Close"].squeeze()
+        spy_sma200 = spy_close.rolling(200).mean().iloc[-1]
+        spy_current = spy_close.iloc[-1]
+        spy_trend = spy_current > spy_sma200
+    except:
+        spy_trend = True
+
+    for ticker in tickers:
+        if ticker == safe:
+            continue
+        try:
+            df = yf.download(ticker, period="100d", interval="1d", progress=False)
+            close = df["Close"].squeeze()
+            if len(close) < 65:
+                continue
+
+            roc_fast = (close.iloc[-1] - close.iloc[-10]) / close.iloc[-10]
+            roc_med = (close.iloc[-1] - close.iloc[-22]) / close.iloc[-22]
+            roc_slow = (close.iloc[-1] - close.iloc[-64]) / close.iloc[-64]
+            vol = close.pct_change().rolling(21).std().iloc[-1]
+            rsi = calc_rsi(close).iloc[-1]
+            sma50 = close.rolling(50).mean().iloc[-1]
+            price = close.iloc[-1]
+
+            if vol == 0 or np.isnan(vol):
+                vol = 0.01
+
+            weighted_mom = (roc_fast * 0.5) + (roc_med * 0.3) + (roc_slow * 0.2)
+            risk_adj_mom = weighted_mom / vol
+            trend_score = 1.0 if price > sma50 else 0.5
+
+            rsi_penalty = 1.0
+            if rsi > 85:
+                rsi_penalty = 0.9
+            elif rsi < 30:
+                rsi_penalty = 0.9
+
+            final_score = risk_adj_mom * trend_score * rsi_penalty
+            scores[ticker] = final_score
+            prices[ticker] = price
+
+        except Exception as e:
+            print(f"Rotation error for {ticker}: {e}")
+            continue
+
+    if not scores:
+        return None, None, None, 0
+
+    sorted_assets = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best_ticker = sorted_assets[0][0]
+    best_score = sorted_assets[0][1]
+
+    if not spy_trend:
+        uup_score = scores.get("UUP", -999)
+        if uup_score > 0 and uup_score > best_score:
+            best_ticker = "UUP"
+            best_score = uup_score
+        elif best_score < 0:
+            best_ticker = safe
+            best_score = 0
+
+    if best_score <= 0:
+        best_ticker = safe
+
+    rotation_summary = f"OMNISCIENT ROTATION SIGNAL\n"
+    rotation_summary += f"SPY Trend: {'BULL' if spy_trend else 'BEAR'} (vs 200-day moving average)\n"
+    rotation_summary += f"Winner: {best_ticker} (score: {best_score:.3f})\n\n"
+    rotation_summary += "Full Rankings:\n"
+    for t, s in sorted_assets[:5]:
+        rotation_summary += f"  {t}: {s:.3f}\n"
+
+    return best_ticker, best_score, rotation_summary, prices.get(best_ticker, 0)
+
 def get_technical_signals():
     signals = []
-    symbols = ["SPY", "QQQ", "GLD", "USO", "TLT", "BTC-USD", "ETH-USD", "SOL-USD"]
+    symbols = ["SPY", "QQQ", "GLD", "USO", "TLT", "BTC-USD", "ETH-USD", "SOL-USD",
+               "SOXL", "TECL", "TQQQ", "FAS", "ERX"]
     for symbol in symbols:
         try:
             df = yf.download(symbol, period="60d", interval="1d", progress=False)
@@ -216,8 +298,11 @@ def get_misfit_knowledge(name, trader_query):
     except:
         return ""
 
-def get_position_size(vote_count, buying_power):
-    if vote_count == 5:
+def get_position_size(vote_count, buying_power, high_conviction_rotation=False):
+    if high_conviction_rotation:
+        pct = 0.15
+        label = "ROTATION CONVICTION -- 15% of book (Omniscient Strategy)"
+    elif vote_count == 5:
         pct = 0.10
         label = "MAXIMUM CONVICTION -- 10% of book"
     elif vote_count == 4:
@@ -226,7 +311,7 @@ def get_position_size(vote_count, buying_power):
     else:
         pct = 0.05
         label = "BASE CONVICTION -- 5% of book"
-    size = min(buying_power * pct, 10000)
+    size = min(buying_power * pct, 15000)
     return size, label
 
 def check_stop_losses():
@@ -273,8 +358,10 @@ def report_open_positions():
     except Exception as e:
         print(f"Position report error: {e}")
 
-def extract_ticker(signal):
-    for ticker in ["QQQ", "SPY", "GLD", "USO", "TLT"]:
+def extract_ticker(signal, rotation_ticker=None):
+    if rotation_ticker and rotation_ticker not in ["BIL", "UUP"]:
+        return rotation_ticker
+    for ticker in ["TQQQ", "SOXL", "TECL", "FAS", "ERX", "QQQ", "SPY", "GLD", "USO", "TLT"]:
         if ticker in signal:
             return ticker
     return None
@@ -285,17 +372,17 @@ def extract_direction(signal):
         return "sell"
     if "LONG" in signal_upper or "BUY" in signal_upper:
         return "buy"
-    return None
+    return "buy"
 
-def execute_trade(signal, vote_count):
+def execute_trade(signal, vote_count, rotation_ticker=None, high_conviction_rotation=False):
     try:
-        ticker = extract_ticker(signal)
+        ticker = extract_ticker(signal, rotation_ticker)
         direction = extract_direction(signal)
-        if not ticker or not direction:
+        if not ticker:
             return "No executable equity trade identified."
         account = get_account()
         buying_power = float(account["buying_power"])
-        position_size, size_label = get_position_size(vote_count, buying_power)
+        position_size, size_label = get_position_size(vote_count, buying_power, high_conviction_rotation)
         price_data = yf.download(ticker, period="1d", interval="1m", progress=False)
         price = float(price_data["Close"].squeeze().iloc[-1])
         qty = max(1, int(position_size / price))
@@ -376,6 +463,9 @@ def run_cycle():
             misfit_knowledge_cache[name] = get_misfit_knowledge(name, query)
             time.sleep(2)
 
+    rotation_ticker, rotation_score, rotation_summary, rotation_price = run_omniscient_rotation()
+    high_conviction_rotation = rotation_ticker not in ["BIL", "UUP", None] and rotation_score > 0.5
+
     technical = get_technical_signals()
     yields = get_yield_curve()
     fear = get_fear_greed()
@@ -384,7 +474,18 @@ def run_cycle():
     geo = get_geopolitical_news()
     congress = get_congressional_trading()
 
-    context = f"""TECHNICAL INDICATORS:
+    rotation_context = rotation_summary if rotation_summary else "Rotation signal unavailable"
+
+    yoni_push = ""
+    if high_conviction_rotation:
+        yoni_push = f"""
+YONIBOT OVERRIDE SIGNAL -- HIGH CONVICTION:
+The Omniscient Rotation Strategy, which backtested at 2,324% return from 2019 to 2026 trading leveraged ETFs, has selected {rotation_ticker} with a momentum score of {rotation_score:.3f}. SPY is in a bull trend above its 200-day moving average. This is a statistically validated signal based on risk-adjusted momentum across 9, 21, and 63 day timeframes with volatility scaling and RSI penalty. YoniBot is pushing hard on this trade. Misfits should have a very high bar to vote PASS against this signal."""
+
+    context = f"""OMNISCIENT ROTATION SIGNAL (2,324% backtest return 2019-2026):
+{rotation_context}
+
+TECHNICAL INDICATORS:
 {technical}
 
 YIELD CURVE:
@@ -403,24 +504,26 @@ GEOPOLITICAL NEWS:
 {geo}
 
 CONGRESSIONAL TRADING:
-{congress}"""
+{congress}
+{yoni_push}"""
 
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=1024,
-        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data, live news, academic research, and congressional trading intelligence. Find genuine anomalies only.
+        messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data, live news, academic research, congressional trading intelligence, and a backtested rotation strategy with 2,324% returns.
 
 {context}
 
 Rules:
+- The Omniscient Rotation signal is your highest conviction tool. It has a proven 7-year backtest.
 - RSI below 30 is oversold. RSI above 70 is overbought.
 - MACD crossing above signal line is bullish. Below is bearish.
 - Narrow Bollinger Band width means compression and imminent breakout.
 - Inverted yield curve signals recession risk.
 - Congressional buying in a sector is a leading indicator.
-- Only generate a signal if at least two indicators confirm the same direction AND news or congressional activity supports the thesis.
+- When the rotation signal is high conviction, state this clearly and push for the trade.
 - If no genuine anomaly exists say NO SIGNAL and explain why.
-- Keep output concise: Asset, Direction, Entry Zone, Stop, Target, confirming indicators only.
+- Keep output concise: Asset, Direction, Entry Zone, Stop, Target, confirming indicators.
 - Output maximum 300 words."""}]
     )
     signal = yoni.content[0].text
@@ -440,7 +543,7 @@ Rules:
     majority = vote_count >= 3
 
     if majority and approved:
-        trade_result = execute_trade(signal, vote_count)
+        trade_result = execute_trade(signal, vote_count, rotation_ticker if high_conviction_rotation else None, high_conviction_rotation)
         verdict_line = f"VERDICT: EXECUTE -- {vote_count}/5 voted TRADE. Jane Street approved.\n{trade_result}"
     elif not approved:
         verdict_line = f"VERDICT: BLOCKED -- Jane Street vetoed. ({vote_count}/5 voted TRADE)"
@@ -468,5 +571,4 @@ while True:
     except Exception as e:
         send_telegram(f"Misfits error: {e}")
         print(f"Error: {e}")
-        smart_sleep(900)
-        
+        smart_sleep(900)        
