@@ -134,13 +134,7 @@ def execute_options_trade(underlying, direction, position_size):
         strike = contract["strike_price"]
         expiry = contract["expiration_date"]
         contract_type = "CALL" if direction == "buy" else "PUT"
-        order = {
-            "symbol": symbol,
-            "qty": 1,
-            "side": "buy",
-            "type": "market",
-            "time_in_force": "day"
-        }
+        order = {"symbol": symbol, "qty": 1, "side": "buy", "type": "market", "time_in_force": "day"}
         result = alpaca_request("POST", "/v2/orders", order)
         order_id = result.get("id", "unknown")
         msg = f"OPTIONS EXECUTED: BUY {contract_type} on {underlying}\nStrike: ${strike} | Expiry: {expiry}\nOrder ID: {order_id}"
@@ -152,12 +146,8 @@ def execute_options_trade(underlying, direction, position_size):
 def execute_crypto_trade(symbol, direction, position_size):
     try:
         crypto_map = {
-            "BTC": "BTC/USD",
-            "ETH": "ETH/USD",
-            "SOL": "SOL/USD",
-            "BITCOIN": "BTC/USD",
-            "ETHEREUM": "ETH/USD",
-            "SOLANA": "SOL/USD"
+            "BTC": "BTC/USD", "ETH": "ETH/USD", "SOL": "SOL/USD",
+            "BITCOIN": "BTC/USD", "ETHEREUM": "ETH/USD", "SOLANA": "SOL/USD"
         }
         crypto_symbol = None
         for key, val in crypto_map.items():
@@ -167,13 +157,7 @@ def execute_crypto_trade(symbol, direction, position_size):
         if not crypto_symbol:
             return None
         notional = min(position_size, 5000)
-        order = {
-            "symbol": crypto_symbol,
-            "notional": str(round(notional, 2)),
-            "side": direction,
-            "type": "market",
-            "time_in_force": "gtc"
-        }
+        order = {"symbol": crypto_symbol, "notional": str(round(notional, 2)), "side": direction, "type": "market", "time_in_force": "gtc"}
         result = alpaca_request("POST", "/v2/orders", order)
         order_id = result.get("id", "unknown")
         msg = f"CRYPTO EXECUTED: {direction.upper()} ${notional:.0f} of {crypto_symbol}\nOrder ID: {order_id}"
@@ -185,7 +169,7 @@ def execute_crypto_trade(symbol, direction, position_size):
 def keepalive():
     try:
         get_account()
-        print(f"Keepalive ping {datetime.utcnow().strftime('%H:%M:%S')}")
+        print(f"Keepalive {datetime.utcnow().strftime('%H:%M:%S')}")
     except:
         pass
 
@@ -318,13 +302,13 @@ def get_arxiv_signals():
     try:
         results = exa.search_and_contents(
             "quantitative finance trading anomaly alpha signal 2025 2026",
-            num_results=3,
+            num_results=5,
             include_domains=["arxiv.org"],
             text={"max_characters": 500}
         )
         papers = []
         for r in results.results:
-            papers.append(f"PAPER: {r.title}\n{r.text[:300]}")
+            papers.append(f"PAPER: {r.title}\n{r.text[:400]}")
         return "\n\n".join(papers)
     except Exception as e:
         return f"arXiv unavailable: {e}"
@@ -333,13 +317,13 @@ def get_market_news():
     try:
         results = exa.search_and_contents(
             "market moving news macro trading today",
-            num_results=5,
+            num_results=7,
             include_domains=["reuters.com", "bloomberg.com", "ft.com", "wsj.com", "cnbc.com"],
-            text={"max_characters": 300}
+            text={"max_characters": 400}
         )
         news = []
         for r in results.results:
-            news.append(f"{r.title}: {r.text[:200]}")
+            news.append(f"{r.title}: {r.text[:300]}")
         return "\n\n".join(news)
     except Exception as e:
         return f"News unavailable: {e}"
@@ -348,12 +332,12 @@ def get_geopolitical_news():
     try:
         results = exa.search_and_contents(
             "Iran Strait of Hormuz oil supply disruption geopolitical risk today",
-            num_results=3,
-            text={"max_characters": 300}
+            num_results=5,
+            text={"max_characters": 400}
         )
         news = []
         for r in results.results:
-            news.append(f"{r.title}: {r.text[:200]}")
+            news.append(f"{r.title}: {r.text[:300]}")
         return "\n\n".join(news)
     except Exception as e:
         return f"Geopolitical news unavailable: {e}"
@@ -373,19 +357,21 @@ def get_congressional_trading():
     except Exception as e:
         return f"Congressional trading unavailable: {e}"
 
-def get_misfit_knowledge(name, trader_query):
-    try:
-        results = exa.search_and_contents(
-            trader_query,
-            num_results=3,
-            text={"max_characters": 400}
-        )
-        knowledge = []
-        for r in results.results:
-            knowledge.append(f"{r.title}: {r.text[:300]}")
-        return "\n\n".join(knowledge)
-    except:
-        return ""
+def get_deep_misfit_knowledge(name, queries):
+    knowledge_blocks = []
+    for query in queries:
+        try:
+            results = exa.search_and_contents(
+                query,
+                num_results=3,
+                text={"max_characters": 500}
+            )
+            for r in results.results:
+                knowledge_blocks.append(f"SOURCE: {r.title}\n{r.text[:400]}")
+            time.sleep(1)
+        except Exception as e:
+            print(f"Knowledge fetch error for {name}: {e}")
+    return "\n\n".join(knowledge_blocks)
 
 def get_position_size(vote_count, buying_power, high_conviction_rotation=False):
     if high_conviction_rotation:
@@ -517,12 +503,12 @@ def execute_trade(signal, vote_count, rotation_ticker=None, high_conviction_rota
             send_performance(f"NEW TRADE\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n{result}")
             return result
         else:
-            return f"Market closed. Crypto only mode. No equity signal executed."
+            return "Market closed. Crypto only mode."
     except Exception as e:
         return f"Trade execution failed: {e}"
 
-def ask_misfit(name, persona, signal, extra_knowledge=""):
-    knowledge_context = f"\n\nRECENT RESEARCH ON YOUR TRADING STYLE:\n{extra_knowledge}" if extra_knowledge else ""
+def ask_misfit(name, persona, signal, knowledge=""):
+    knowledge_context = f"\n\nDEEP KNOWLEDGE BASE FOR {name.upper()}:\n{knowledge}" if knowledge else ""
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=400,
@@ -542,28 +528,53 @@ def ask_jane_street(signal, verdicts):
 MISFITS = [
     (
         "Soros",
-        "You ARE George Soros. You broke the Bank of England on Black Wednesday 1992. Find the hidden peg in every market. Where is the lie everyone believes and when do the defenders run out of ammunition?",
-        "George Soros Black Wednesday 1992 pound sterling ERM trade reflexivity biggest win interview"
+        "You ARE George Soros. You broke the Bank of England on Black Wednesday 1992. Find the hidden peg in every market. Where is the lie everyone believes and when do the defenders run out of ammunition? You have deeply studied reflexivity theory, currency crises, and regime breaks your entire career.",
+        [
+            "George Soros Black Wednesday 1992 pound sterling ERM trade how he did it",
+            "George Soros reflexivity theory market philosophy interview 2024 2025",
+            "George Soros biggest trades currency crisis methodology thinking process",
+            "Soros Fund Management macro strategy current market views 2025 2026"
+        ]
     ),
     (
         "Druckenmiller",
-        "You ARE Stanley Druckenmiller. You think about what you can lose before what you can make. State your stop level first, then your target, then your conviction size.",
-        "Stanley Druckenmiller biggest trade win asymmetric bet risk management interview Ira Sohn"
+        "You ARE Stanley Druckenmiller. You think about what you can lose before what you can make. You have studied every major market cycle of the last 50 years. You concentrate your best ideas and size them asymmetrically. State your stop level first, then your target, then your conviction size.",
+        [
+            "Stanley Druckenmiller biggest trade win asymmetric bet risk management",
+            "Stanley Druckenmiller investment philosophy concentration macro interview 2024 2025",
+            "Druckenmiller current market views macro outlook 2025 2026",
+            "Stanley Druckenmiller how he thinks about risk reward position sizing"
+        ]
     ),
     (
         "PTJ",
-        "You ARE Paul Tudor Jones. You called Black Monday 1987. You never get out of bed for less than 5 to 1 risk reward. Does a 5 to 1 setup exist here? Where is the hard stop?",
-        "Paul Tudor Jones Black Monday 1987 prediction trading rules risk management documentary interview"
+        "You ARE Paul Tudor Jones. You called Black Monday 1987. You never get out of bed for less than 5 to 1 risk reward. You have studied every major market crash and rally. Does a 5 to 1 setup exist here? Where is the hard stop?",
+        [
+            "Paul Tudor Jones Black Monday 1987 prediction how he called it",
+            "Paul Tudor Jones trading rules risk management 5 to 1 philosophy",
+            "Paul Tudor Jones current market views macro 2025 2026 interview",
+            "PTJ Tudor Investment macro strategy technical analysis approach"
+        ]
     ),
     (
         "Tepper",
-        "You ARE David Tepper. You made 7 billion dollars in 2009 buying bank bonds. Read the policy backdrop. Is the Fed with us or against us?",
-        "David Tepper 2009 bank trade Appaloosa biggest win Fed policy interview CNBC"
+        "You ARE David Tepper. You made 7 billion dollars in 2009 buying bank bonds when everyone thought the system was ending. You read government policy before markets do. Is the Federal Reserve with us or against us?",
+        [
+            "David Tepper 2009 bank trade how he made billions Appaloosa",
+            "David Tepper Federal Reserve policy reading investment strategy interview",
+            "David Tepper current market views Fed policy 2025 2026",
+            "Tepper Appaloosa macro investing credit equity approach methodology"
+        ]
     ),
     (
         "Andurand",
-        "You ARE Pierre Andurand. You called the 2008 oil spike and the 2022 energy crisis by tracking physical flows. Read tanker movements, refinery margins, and geopolitical chokepoints.",
-        "Pierre Andurand oil trade 2008 2022 biggest win physical commodity flows interview letter"
+        "You ARE Pierre Andurand. You called the 2008 oil spike, the 2014 crash, and the 2022 Russia Ukraine energy crisis by tracking physical flows before they showed in price. Read tanker movements, refinery margins, and geopolitical chokepoints.",
+        [
+            "Pierre Andurand oil trade 2008 2022 how he called the move",
+            "Pierre Andurand physical commodity flows methodology tanker markets",
+            "Andurand Capital oil market views 2025 2026 current outlook",
+            "Pierre Andurand geopolitical risk energy supply disruption framework"
+        ]
     ),
 ]
 
@@ -581,10 +592,11 @@ def run_cycle():
         report_open_positions()
 
     if cycle_count % knowledge_refresh_cycles == 1:
-        print("Refreshing Misfit knowledge bases...")
-        for name, persona, query in MISFITS:
-            misfit_knowledge_cache[name] = get_misfit_knowledge(name, query)
-            time.sleep(2)
+        print("Refreshing deep Misfit knowledge bases...")
+        for name, persona, queries in MISFITS:
+            print(f"  Loading knowledge for {name}...")
+            misfit_knowledge_cache[name] = get_deep_misfit_knowledge(name, queries)
+            time.sleep(3)
 
     market_open = is_market_hours()
     rotation_ticker, rotation_score, rotation_summary, rotation_price = run_omniscient_rotation()
@@ -599,13 +611,13 @@ def run_cycle():
     congress = get_congressional_trading()
 
     rotation_context = rotation_summary if rotation_summary else "Rotation signal unavailable"
-    market_status = "OPEN -- equities, options, and crypto available" if market_open else "CLOSED -- crypto only, markets reopen Monday 9:30 AM ET"
+    market_status = "OPEN -- equities, options, and crypto available" if market_open else "CLOSED -- crypto only"
 
     yoni_push = ""
     if high_conviction_rotation:
         yoni_push = f"""
 YONIBOT OVERRIDE -- HIGH CONVICTION ROTATION:
-The Omniscient Rotation Strategy (2,324% backtest 2019-2026) has selected {rotation_ticker} score {rotation_score:.3f}. SPY is in bull trend. This is statistically validated momentum rotation. YoniBot is pushing hard. Misfits need a very high bar to vote PASS."""
+Omniscient Rotation Strategy (2,324% backtest 2019-2026) selected {rotation_ticker} score {rotation_score:.3f}. SPY in bull trend. Statistically validated. YoniBot is pushing hard. Misfits need very high bar to vote PASS."""
 
     context = f"""MARKET STATUS: {market_status}
 
@@ -634,7 +646,7 @@ CONGRESSIONAL TRADING:
 {congress}
 {yoni_push}"""
 
-    weekend_crypto_note = "" if market_open else "\nMARKET IS CLOSED. Focus on crypto signals only. Bitcoin, Ethereum, Solana trade 24/7. Generate crypto signals or NO SIGNAL."
+    weekend_note = "" if market_open else "\nMARKET CLOSED. Crypto signals only. Bitcoin, Ethereum, Solana trade 24/7."
 
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
@@ -642,17 +654,17 @@ CONGRESSIONAL TRADING:
         messages=[{"role": "user", "content": f"""You are YoniBot. You have real statistical data, live news, academic research, congressional intelligence, and a backtested rotation strategy with 2,324% returns.
 
 {context}
-{weekend_crypto_note}
+{weekend_note}
 
 Rules:
-- The Omniscient Rotation signal is your highest conviction tool.
-- RSI below 30 is oversold. RSI above 70 is overbought.
-- MACD crossing above signal line is bullish. Below is bearish.
+- Omniscient Rotation signal is your highest conviction tool.
+- RSI below 30 oversold. RSI above 70 overbought.
+- MACD crossing above signal line bullish. Below bearish.
 - Narrow Bollinger Band width means compression and imminent breakout.
-- During market hours: equity, options, and crypto signals valid.
-- After hours and weekends: crypto signals only.
-- When rotation signal is high conviction, push hard for the trade.
-- If no genuine anomaly exists say NO SIGNAL and explain why.
+- Inverted yield curve signals recession risk.
+- Congressional buying is a leading indicator.
+- When rotation signal is high conviction push hard for the trade.
+- If no genuine anomaly say NO SIGNAL and explain why.
 - Output: Asset, Direction, Entry Zone, Stop, Target, confirming indicators.
 - Maximum 300 words."""}]
     )
@@ -661,7 +673,7 @@ Rules:
     verdicts = []
     vote_count = 0
 
-    for name, persona, query in MISFITS:
+    for name, persona, queries in MISFITS:
         knowledge = misfit_knowledge_cache.get(name, "")
         verdict = ask_misfit(name, persona, signal, knowledge)
         verdicts.append((name, verdict))
