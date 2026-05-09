@@ -26,35 +26,32 @@ INCEPTION_VALUE = 100000
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 exa = Exa(api_key=EXA_API_KEY)
 
-MAX_POSITION_PCT = 0.15
-MAX_EQUITY_PCT = 0.40
-MAX_CRYPTO_PCT = 0.20
-MAX_LEVERAGED_PCT = 0.30
-MAX_OPEN_POSITIONS = 4
-MAX_ORDERS_PER_CYCLE = 2
-MIN_CASH_PCT = 0.40
-DAILY_LOSS_LIMIT = 0.03
-WEEKLY_LOSS_LIMIT = 0.07
-MONTHLY_LOSS_LIMIT = 0.15
-CONSECUTIVE_LOSS_LIMIT = 3
+# FIVE NON-NEGOTIABLE RULES -- DRUCKENMILLER MODEL
+MAX_ORDERS_PER_CYCLE = 2          # Knight Capital prevention
+DAILY_LOSS_LIMIT = 0.03           # One circuit breaker only
+FRIDAY_SHORT_CUTOFF_HOUR = 14     # No new shorts after 2 PM ET Friday
+FRIDAY_SHORT_CLOSE_HOUR = 15      # Close losing shorts by 3:30 PM ET Friday
+FRIDAY_SHORT_CLOSE_MINUTE = 30
+
+# POSITION SIZING -- aggressive when conviction is high
+CONVICTION_SIZING = {5: 0.05, 4: 0.08, 3: 0.05}
+ROTATION_SIZE = 0.15
+MAX_SINGLE_POSITION = 0.15
 VIX_REDUCE_THRESHOLD = 35
 VIX_STOP_THRESHOLD = 50
+
+# ALLOCATION GUARDRAILS -- not gates, just caps
+MAX_EQUITY_PCT = 0.60
+MAX_CRYPTO_PCT = 0.25
+MAX_LEVERAGED_PCT = 0.45
 DUPLICATE_SIGNAL_BLOCKS = 2
-FRIDAY_SHORT_CUTOFF_HOUR = 14
-FRIDAY_SHORT_CLOSE_HOUR = 15
-FRIDAY_SHORT_CLOSE_MINUTE = 30
+
+LEVERAGED_ETFS = {"TQQQ", "SOXL", "TECL", "FAS", "ERX", "TMF", "SPXL", "UPRO"}
 
 recent_signals = {}
 daily_start_value = None
-weekly_start_value = None
-monthly_start_value = None
 trades_halted_today = False
-trades_halted_weekly = False
-trades_halted_monthly = False
-consecutive_losses = 0
 orders_this_cycle = 0
-
-LEVERAGED_ETFS = {"TQQQ", "SOXL", "TECL", "FAS", "ERX", "TMF", "SPXL", "UPRO"}
 
 misfit_scorecard = {
     "Soros": {"correct": 0, "total": 0},
@@ -141,31 +138,7 @@ Exit price: ${exit_price:.2f}
 Result: {result} ({pnl_pct:+.1f}%)
 
 Short positions do not survive weekends.
-Weekend gaps can blow through stop losses before markets open Monday.
 Capital protected.
-
--- Satis House Consulting"""
-
-def format_circuit_breaker_alert(reason, pct_down, period):
-    return f"""⚡ CIRCUIT BREAKER TRIGGERED
-
-{reason}
-Portfolio down {abs(pct_down)*100:.1f}% this {period}.
-
-All new trades halted until {period} resets.
-Existing positions remain open.
-Capital protection mode active.
-
--- Satis House Consulting"""
-
-def format_consecutive_loss_alert(count):
-    return f"""⚠️ CONSECUTIVE LOSS WARNING
-
-The Misfits have had {count} losing trades in a row.
-Pausing new positions to reassess market conditions.
-
-Existing positions remain open.
-System will resume after market review.
 
 -- Satis House Consulting"""
 
@@ -224,9 +197,6 @@ def get_account():
 def get_positions():
     return alpaca_request("GET", "/v2/positions")
 
-def get_orders(status="open"):
-    return alpaca_request("GET", "/v2/orders", params={"status": status})
-
 def cancel_all_orders():
     return alpaca_request("DELETE", "/v2/orders")
 
@@ -255,11 +225,10 @@ def verify_order_filled(order_id, max_wait=30):
             if status in ["filled", "partially_filled"]:
                 return True
             if status in ["canceled", "rejected", "expired"]:
-                print(f"Order {order_id} failed with status: {status}")
+                print(f"Order {order_id} failed: {status}")
                 return False
         except Exception as e:
-            print(f"Order verification error: {e}")
-    print(f"Order {order_id} did not confirm fill within {max_wait}s")
+            print(f"Order verify error: {e}")
     return False
 
 def submit_stop_loss_atomic(symbol, qty, side, stop_price):
@@ -272,15 +241,14 @@ def submit_stop_loss_atomic(symbol, qty, side, stop_price):
             "stop_price": str(round(stop_price, 2)),
             "time_in_force": "gtc"
         })
-        order_id = result.get("id")
-        if not order_id:
-            print(f"Stop loss submission failed for {symbol} -- closing position for safety")
+        if not result.get("id"):
+            print(f"Stop loss failed for {symbol} -- closing position")
             close_position(symbol)
-            send_performance(f"⚠️ SAFETY CLOSE\n\nCould not set stop loss on {symbol}.\nPosition closed immediately to protect capital.\n\n-- Satis House Consulting")
+            send_performance(f"⚠️ SAFETY CLOSE\n\nCould not set stop loss on {symbol}.\nPosition closed to protect capital.\n\n-- Satis House Consulting")
             return False
         return True
     except Exception as e:
-        print(f"Stop loss atomic error for {symbol}: {e} -- closing position")
+        print(f"Stop loss atomic error {symbol}: {e} -- closing")
         close_position(symbol)
         return False
 
@@ -301,7 +269,8 @@ def is_friday_short_blocked():
 def should_close_friday_shorts():
     et = pytz.timezone("America/New_York")
     now = datetime.now(et)
-    return now.weekday() == 4 and (now.hour > FRIDAY_SHORT_CLOSE_HOUR or (now.hour == FRIDAY_SHORT_CLOSE_HOUR and now.minute >= FRIDAY_SHORT_CLOSE_MINUTE))
+    return now.weekday() == 4 and (now.hour > FRIDAY_SHORT_CLOSE_HOUR or
+           (now.hour == FRIDAY_SHORT_CLOSE_HOUR and now.minute >= FRIDAY_SHORT_CLOSE_MINUTE))
 
 def close_friday_shorts(portfolio_state):
     if not portfolio_state or not portfolio_state["positions"]:
@@ -312,10 +281,9 @@ def close_friday_shorts(portfolio_state):
                 close_position(symbol)
                 msg = format_friday_close_alert(symbol, pos["current_price"], pos["unrealized_pnl"], pos["unrealized_pct"])
                 send_performance(msg)
-                send_telegram(f"Friday risk management: closed short {symbol} before weekend.")
-                print(f"Friday close: {symbol} short position closed")
+                print(f"Friday close: {symbol}")
             except Exception as e:
-                print(f"Friday close error for {symbol}: {e}")
+                print(f"Friday close error {symbol}: {e}")
 
 def get_vix():
     try:
@@ -330,7 +298,6 @@ def get_portfolio_state():
         positions = get_positions()
         portfolio_value = float(account.get("portfolio_value", 100000))
         buying_power = float(account.get("buying_power", 50000))
-        cash = float(account.get("cash", 100000))
 
         position_map = {}
         equity_value = 0
@@ -349,13 +316,9 @@ def get_portfolio_state():
                 unrealized_pct = float(pos.get("unrealized_plpc", 0)) * 100
 
                 position_map[symbol] = {
-                    "side": side,
-                    "qty": qty,
-                    "market_value": market_val,
-                    "avg_entry": avg_entry,
-                    "current_price": current_price,
-                    "unrealized_pnl": unrealized_pnl,
-                    "unrealized_pct": unrealized_pct,
+                    "side": side, "qty": qty, "market_value": market_val,
+                    "avg_entry": avg_entry, "current_price": current_price,
+                    "unrealized_pnl": unrealized_pnl, "unrealized_pct": unrealized_pct,
                     "pct_of_portfolio": abs(market_val) / portfolio_value if portfolio_value > 0 else 0
                 }
 
@@ -366,19 +329,9 @@ def get_portfolio_state():
                 else:
                     equity_value += abs(market_val)
 
-        total_deployed = equity_value + crypto_value + leveraged_value
-        cash_pct = (portfolio_value - total_deployed) / portfolio_value if portfolio_value > 0 else 1.0
-
         return {
-            "portfolio_value": portfolio_value,
-            "buying_power": buying_power,
-            "cash": cash,
-            "cash_pct": cash_pct,
+            "portfolio_value": portfolio_value, "buying_power": buying_power,
             "positions": position_map,
-            "position_count": len(position_map),
-            "equity_value": equity_value,
-            "crypto_value": crypto_value,
-            "leveraged_value": leveraged_value,
             "equity_pct": equity_value / portfolio_value if portfolio_value > 0 else 0,
             "crypto_pct": crypto_value / portfolio_value if portfolio_value > 0 else 0,
             "leveraged_pct": leveraged_value / portfolio_value if portfolio_value > 0 else 0
@@ -387,74 +340,38 @@ def get_portfolio_state():
         print(f"Portfolio state error: {e}")
         return None
 
-def check_loss_limits(portfolio_state):
-    global trades_halted_today, trades_halted_weekly, trades_halted_monthly
-    global daily_start_value, weekly_start_value, monthly_start_value
+def check_execution_rules(ticker, direction, position_size, portfolio_state, vix):
+    global trades_halted_today, daily_start_value, orders_this_cycle
+
+    if orders_this_cycle >= MAX_ORDERS_PER_CYCLE:
+        return False, "Max orders per cycle -- Knight Capital rule"
+
+    if trades_halted_today:
+        return False, "Daily loss limit hit"
 
     if portfolio_state is None:
-        return
+        return False, "Portfolio state unavailable"
 
     portfolio_value = portfolio_state["portfolio_value"]
 
     if daily_start_value is not None:
         daily_pnl = (portfolio_value - daily_start_value) / daily_start_value
-        if daily_pnl <= -DAILY_LOSS_LIMIT and not trades_halted_today:
+        if daily_pnl <= -DAILY_LOSS_LIMIT:
             trades_halted_today = True
-            send_performance(format_circuit_breaker_alert("Daily loss limit reached.", daily_pnl, "day"))
-
-    if weekly_start_value is not None:
-        weekly_pnl = (portfolio_value - weekly_start_value) / weekly_start_value
-        if weekly_pnl <= -WEEKLY_LOSS_LIMIT and not trades_halted_weekly:
-            trades_halted_weekly = True
-            send_performance(format_circuit_breaker_alert("Weekly loss limit reached.", weekly_pnl, "week"))
-
-    if monthly_start_value is not None:
-        monthly_pnl = (portfolio_value - monthly_start_value) / monthly_start_value
-        if monthly_pnl <= -MONTHLY_LOSS_LIMIT and not trades_halted_monthly:
-            trades_halted_monthly = True
-            send_performance(format_circuit_breaker_alert("Monthly loss limit reached.", monthly_pnl, "month"))
-
-def check_execution_rules(ticker, direction, position_size, portfolio_state, vix):
-    global orders_this_cycle, consecutive_losses
-
-    if portfolio_state is None:
-        return False, "Portfolio state unavailable"
-
-    if orders_this_cycle >= MAX_ORDERS_PER_CYCLE:
-        return False, f"Max orders per cycle reached ({MAX_ORDERS_PER_CYCLE}) -- Knight Capital protection"
-
-    if trades_halted_today:
-        return False, "Daily loss limit hit -- trading halted"
-
-    if trades_halted_weekly:
-        return False, "Weekly loss limit hit -- trading halted"
-
-    if trades_halted_monthly:
-        return False, "Monthly loss limit hit -- trading halted"
-
-    if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
-        return False, f"{consecutive_losses} consecutive losses -- pausing new positions"
-
-    portfolio_value = portfolio_state["portfolio_value"]
-    positions = portfolio_state["positions"]
-
-    if portfolio_state["position_count"] >= MAX_OPEN_POSITIONS:
-        return False, f"Max open positions reached ({MAX_OPEN_POSITIONS})"
-
-    if portfolio_state["cash_pct"] < MIN_CASH_PCT:
-        return False, f"Cash below minimum {MIN_CASH_PCT*100:.0f}% -- protecting liquidity"
+            send_performance(f"⚡ CIRCUIT BREAKER\n\nPortfolio down {abs(daily_pnl)*100:.1f}% today.\nAll trading paused until tomorrow.\nCapital protected.\n\n-- Satis House Consulting")
+            return False, "Daily loss limit triggered"
 
     if vix >= VIX_STOP_THRESHOLD:
-        return False, "VIX too high for new trades"
+        return False, f"VIX {vix:.0f} -- above danger threshold"
 
     if direction == "sell" and is_friday_short_blocked():
-        return False, "No new shorts after 2 PM ET on Fridays"
+        return False, "Friday short rule -- no new shorts after 2 PM ET"
 
     signal_key = f"{ticker}_{direction}"
-    if signal_key in recent_signals:
-        if recent_signals[signal_key] < DUPLICATE_SIGNAL_BLOCKS:
-            return False, "Same trade too recent"
+    if signal_key in recent_signals and recent_signals[signal_key] < DUPLICATE_SIGNAL_BLOCKS:
+        return False, "Duplicate signal -- waiting"
 
+    positions = portfolio_state["positions"]
     if ticker in positions:
         existing = positions[ticker]
         if existing["side"] == "long" and direction == "buy":
@@ -466,35 +383,46 @@ def check_execution_rules(ticker, direction, position_size, portfolio_state, vix
     is_leveraged = ticker in LEVERAGED_ETFS
 
     if is_leveraged and not is_market_hours():
-        return False, f"{ticker} only trades during market hours"
+        return False, "Leveraged ETF -- market hours only"
 
     if not is_crypto and not is_market_hours():
         return False, "Market closed"
 
+    if vix >= VIX_REDUCE_THRESHOLD:
+        pass
+
     if is_leveraged and portfolio_state["leveraged_pct"] >= MAX_LEVERAGED_PCT:
-        return False, "At max leveraged allocation"
+        return False, "Leveraged allocation cap reached"
     elif is_crypto and portfolio_state["crypto_pct"] >= MAX_CRYPTO_PCT:
-        return False, "At max crypto allocation"
+        return False, "Crypto allocation cap reached"
     elif not is_crypto and not is_leveraged and portfolio_state["equity_pct"] >= MAX_EQUITY_PCT:
-        return False, "At max equity allocation"
+        return False, "Equity allocation cap reached"
 
-    max_position_dollar = portfolio_value * MAX_POSITION_PCT
-    if position_size > max_position_dollar:
-        position_size = max_position_dollar
+    return True, "Clear"
 
-    return True, "All checks passed"
+def get_position_size(vote_count, portfolio_value, vix, high_conviction_rotation=False):
+    if high_conviction_rotation:
+        base_pct = ROTATION_SIZE
+        label = "15% of portfolio -- rotation conviction"
+    elif vote_count == 5:
+        base_pct = 0.10
+        label = "10% of portfolio -- maximum conviction"
+    elif vote_count == 4:
+        base_pct = 0.08
+        label = "8% of portfolio -- high conviction"
+    else:
+        base_pct = 0.05
+        label = "5% of portfolio -- base conviction"
+
+    if vix >= VIX_REDUCE_THRESHOLD:
+        base_pct = base_pct * 0.5
+        label = f"reduced to {base_pct*100:.0f}% -- VIX elevated at {vix:.0f}"
+
+    size = min(portfolio_value * base_pct, portfolio_value * MAX_SINGLE_POSITION)
+    return size, label
 
 def update_training_loop(ticker, voters_for, voters_against, outcome_pnl_pct):
-    global misfit_scorecard, consecutive_losses
     trade_was_profitable = outcome_pnl_pct > 0
-
-    if trade_was_profitable:
-        consecutive_losses = 0
-    else:
-        consecutive_losses += 1
-        if consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
-            send_performance(format_consecutive_loss_alert(consecutive_losses))
-
     for name in voters_for:
         if name in misfit_scorecard:
             misfit_scorecard[name]["total"] += 1
@@ -513,9 +441,7 @@ def build_scorecard_context():
         if total > 0:
             win_rate = scores["correct"] / total * 100
             lines.append(f"{name}: {win_rate:.0f}% win rate ({scores['correct']}/{total} trades)")
-    if lines:
-        return "MISFIT TRACK RECORD:\n" + "\n".join(lines)
-    return ""
+    return "MISFIT TRACK RECORD:\n" + "\n".join(lines) if lines else ""
 
 def keepalive():
     try:
@@ -550,8 +476,7 @@ def run_omniscient_rotation():
         spy_data = yf.download("SPY", period="220d", interval="1d", progress=False)
         spy_close = spy_data["Close"].squeeze()
         spy_sma200 = spy_close.rolling(200).mean().iloc[-1]
-        spy_current = spy_close.iloc[-1]
-        spy_trend = spy_current > spy_sma200
+        spy_trend = spy_close.iloc[-1] > spy_sma200
     except:
         spy_trend = True
     for ticker in tickers:
@@ -574,35 +499,28 @@ def run_omniscient_rotation():
             weighted_mom = (roc_fast * 0.5) + (roc_med * 0.3) + (roc_slow * 0.2)
             risk_adj_mom = weighted_mom / vol
             trend_score = 1.0 if price > sma50 else 0.5
-            rsi_penalty = 1.0
-            if rsi > 85 or rsi < 30:
-                rsi_penalty = 0.9
+            rsi_penalty = 0.9 if (rsi > 85 or rsi < 30) else 1.0
             final_score = risk_adj_mom * trend_score * rsi_penalty
             scores[ticker] = final_score
             prices[ticker] = price
         except Exception as e:
-            print(f"Rotation error for {ticker}: {e}")
+            print(f"Rotation error {ticker}: {e}")
     if not scores:
         return None, None, None, 0
     sorted_assets = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    best_ticker = sorted_assets[0][0]
-    best_score = sorted_assets[0][1]
+    best_ticker, best_score = sorted_assets[0]
     if not spy_trend:
         uup_score = scores.get("UUP", -999)
         if uup_score > 0 and uup_score > best_score:
-            best_ticker = "UUP"
-            best_score = uup_score
+            best_ticker, best_score = "UUP", uup_score
         elif best_score < 0:
-            best_ticker = safe
-            best_score = 0
+            best_ticker, best_score = safe, 0
     if best_score <= 0:
         best_ticker = safe
-    rotation_summary = f"OMNISCIENT ROTATION SIGNAL\n"
-    rotation_summary += f"SPY Trend: {'BULL' if spy_trend else 'BEAR'}\n"
-    rotation_summary += f"Winner: {best_ticker} (score: {best_score:.3f})\n"
+    summary = f"OMNISCIENT ROTATION\nSPY: {'BULL' if spy_trend else 'BEAR'}\nWinner: {best_ticker} ({best_score:.3f})\n"
     for t, s in sorted_assets[:5]:
-        rotation_summary += f"  {t}: {s:.3f}\n"
-    return best_ticker, best_score, rotation_summary, prices.get(best_ticker, 0)
+        summary += f"  {t}: {s:.3f}\n"
+    return best_ticker, best_score, summary, prices.get(best_ticker, 0)
 
 def get_technical_signals():
     signals = []
@@ -615,15 +533,11 @@ def get_technical_signals():
             rsi = calc_rsi(close).iloc[-1]
             ema12 = close.ewm(span=12).mean()
             ema26 = close.ewm(span=26).mean()
-            macd = ema12 - ema26
-            signal_line = macd.ewm(span=9).mean()
-            macd_val = macd.iloc[-1]
-            signal_val = signal_line.iloc[-1]
-            sma20 = close.rolling(20).mean()
-            std20 = close.rolling(20).std()
-            bb_width = (4 * std20).iloc[-1]
+            macd = (ema12 - ema26).iloc[-1]
+            signal_line = (ema12 - ema26).ewm(span=9).mean().iloc[-1]
+            bb_width = (4 * close.rolling(20).std()).iloc[-1]
             price = close.iloc[-1]
-            signals.append(f"{symbol}: Price={price:.2f}, RSI={rsi:.1f}, MACD={macd_val:.3f}, Signal={signal_val:.3f}, BB_Width={bb_width:.2f}")
+            signals.append(f"{symbol}: ${price:.2f} RSI={rsi:.0f} MACD={macd:.3f} Signal={signal_line:.3f} BB={bb_width:.2f}")
         except:
             pass
     return "\n".join(signals)
@@ -633,8 +547,7 @@ def get_yield_curve():
         t2 = yf.download("^IRX", period="5d", progress=False)["Close"].squeeze().iloc[-1]
         t10 = yf.download("^TNX", period="5d", progress=False)["Close"].squeeze().iloc[-1]
         t30 = yf.download("^TYX", period="5d", progress=False)["Close"].squeeze().iloc[-1]
-        spread = t10 - t2
-        return f"2Y={t2:.2f}% 10Y={t10:.2f}% 30Y={t30:.2f}% Spread(10-2)={spread:.2f}%"
+        return f"2Y={t2:.2f}% 10Y={t10:.2f}% 30Y={t30:.2f}% Spread={t10-t2:.2f}%"
     except:
         return "Yield curve unavailable"
 
@@ -649,92 +562,57 @@ def get_arxiv_signals():
     try:
         results = exa.search_and_contents(
             "quantitative finance trading anomaly alpha signal 2025 2026",
-            num_results=5,
-            include_domains=["arxiv.org"],
+            num_results=5, include_domains=["arxiv.org"],
             text={"max_characters": 500}
         )
-        papers = []
-        for r in results.results:
-            papers.append(f"PAPER: {r.title}\n{r.text[:400]}")
-        return "\n\n".join(papers)
+        return "\n\n".join([f"PAPER: {r.title}\n{r.text[:400]}" for r in results.results])
     except Exception as e:
         return f"arXiv unavailable: {e}"
 
 def get_market_news():
     try:
         results = exa.search_and_contents(
-            "market moving news macro trading today",
-            num_results=7,
+            "market moving news macro trading today", num_results=7,
             include_domains=["reuters.com", "bloomberg.com", "ft.com", "wsj.com", "cnbc.com"],
             text={"max_characters": 400}
         )
-        news = []
-        for r in results.results:
-            news.append(f"{r.title}: {r.text[:300]}")
-        return "\n\n".join(news)
+        return "\n\n".join([f"{r.title}: {r.text[:300]}" for r in results.results])
     except Exception as e:
         return f"News unavailable: {e}"
 
 def get_geopolitical_news():
     try:
         results = exa.search_and_contents(
-            "Iran Strait of Hormuz oil supply disruption geopolitical risk today",
-            num_results=5,
-            text={"max_characters": 400}
+            "Iran Strait Hormuz oil supply disruption geopolitical risk today",
+            num_results=5, text={"max_characters": 400}
         )
-        news = []
-        for r in results.results:
-            news.append(f"{r.title}: {r.text[:300]}")
-        return "\n\n".join(news)
+        return "\n\n".join([f"{r.title}: {r.text[:300]}" for r in results.results])
     except Exception as e:
-        return f"Geopolitical news unavailable: {e}"
+        return f"Geo news unavailable: {e}"
 
 def get_congressional_trading():
     try:
         results = exa.search_and_contents(
-            "congress senator representative stock trade purchase sale disclosure 2026",
-            num_results=5,
+            "congress senator stock trade purchase sale disclosure 2026", num_results=5,
             include_domains=["quiverquant.com", "capitoltrades.com", "housestockwatcher.com", "senatestockwatcher.com"],
             text={"max_characters": 300}
         )
-        trades = []
-        for r in results.results:
-            trades.append(f"{r.title}: {r.text[:200]}")
-        return "\n\n".join(trades) if trades else "No recent congressional trades found"
+        trades = [f"{r.title}: {r.text[:200]}" for r in results.results]
+        return "\n\n".join(trades) if trades else "No recent congressional trades"
     except Exception as e:
-        return f"Congressional trading unavailable: {e}"
+        return f"Congressional unavailable: {e}"
 
 def get_deep_misfit_knowledge(name, queries):
-    knowledge_blocks = []
+    blocks = []
     for query in queries:
         try:
-            results = exa.search_and_contents(
-                query,
-                num_results=3,
-                text={"max_characters": 500}
-            )
+            results = exa.search_and_contents(query, num_results=3, text={"max_characters": 500})
             for r in results.results:
-                knowledge_blocks.append(f"SOURCE: {r.title}\n{r.text[:400]}")
+                blocks.append(f"SOURCE: {r.title}\n{r.text[:400]}")
             time.sleep(1)
         except Exception as e:
-            print(f"Knowledge fetch error for {name}: {e}")
-    return "\n\n".join(knowledge_blocks)
-
-def get_position_size(vote_count, portfolio_value, vix, high_conviction_rotation=False):
-    base_pct = 0.15 if high_conviction_rotation else (0.10 if vote_count == 5 else (0.08 if vote_count == 4 else 0.05))
-    if vix >= VIX_REDUCE_THRESHOLD:
-        base_pct = base_pct * 0.5
-        label = f"reduced size due to high volatility ({base_pct*100:.0f}% of portfolio)"
-    elif high_conviction_rotation:
-        label = "15% of portfolio -- rotation conviction"
-    elif vote_count == 5:
-        label = "10% of portfolio -- maximum conviction"
-    elif vote_count == 4:
-        label = "8% of portfolio -- high conviction"
-    else:
-        label = "5% of portfolio -- base conviction"
-    size = min(portfolio_value * base_pct, 15000)
-    return size, label
+            print(f"Knowledge error {name}: {e}")
+    return "\n\n".join(blocks)
 
 def check_stop_losses(portfolio_state):
     try:
@@ -743,16 +621,13 @@ def check_stop_losses(portfolio_state):
         for symbol, pos in portfolio_state["positions"].items():
             unrealized_pct = pos["unrealized_pct"]
             side = pos["side"]
-            current_price = pos["current_price"]
-            unrealized_pnl = pos["unrealized_pnl"]
             stop_triggered = (side == "long" and unrealized_pct <= -5) or (side == "short" and unrealized_pct <= -5)
             if stop_triggered:
                 close_position(symbol)
-                msg = format_stop_loss_alert(symbol, current_price, unrealized_pnl, unrealized_pct)
+                msg = format_stop_loss_alert(symbol, pos["current_price"], pos["unrealized_pnl"], unrealized_pct)
                 send_performance(msg)
-                send_telegram(f"Stop loss hit on {symbol}. See performance channel.")
-                voters_for = []
-                voters_against = []
+                send_telegram(f"Stop loss hit on {symbol}.")
+                voters_for, voters_against = [], []
                 for trade in reversed(trade_history):
                     if trade.get("ticker") == symbol:
                         voters_for = trade.get("voters_for", [])
@@ -760,7 +635,7 @@ def check_stop_losses(portfolio_state):
                         break
                 update_training_loop(symbol, voters_for, voters_against, unrealized_pct / 100)
     except Exception as e:
-        print(f"Stop loss check error: {e}")
+        print(f"Stop loss error: {e}")
 
 def report_open_positions(portfolio_state):
     try:
@@ -769,8 +644,7 @@ def report_open_positions(portfolio_state):
         daily_pnl = None
         if daily_start_value and portfolio_state:
             daily_pnl = (portfolio_state["portfolio_value"] - daily_start_value) / daily_start_value
-        msg = format_position_report(portfolio_state, daily_pnl)
-        send_performance(msg)
+        send_performance(format_position_report(portfolio_state, daily_pnl))
     except Exception as e:
         print(f"Position report error: {e}")
 
@@ -783,21 +657,18 @@ def extract_ticker(signal, rotation_ticker=None):
     return None
 
 def extract_crypto(signal):
-    signal_upper = signal.upper()
     for crypto in ["BITCOIN", "BTC", "ETHEREUM", "ETH", "SOLANA", "SOL"]:
-        if crypto in signal_upper:
+        if crypto in signal.upper():
             return crypto
     return None
 
 def extract_direction(signal):
-    if "SHORT" in signal.upper():
-        return "sell"
-    return "buy"
+    return "sell" if "SHORT" in signal.upper() else "buy"
 
 def extract_reason(signal):
     lines = signal.strip().split("\n")
     for line in lines:
-        if any(word in line.lower() for word in ["because", "thesis", "signal", "confirmed", "why", "momentum", "breakout", "oversold", "overbought"]):
+        if any(word in line.lower() for word in ["because", "thesis", "confirmed", "why", "momentum", "breakout", "oversold", "overbought"]):
             return line.strip()
     return lines[0].strip() if lines else "Multiple indicators confirmed"
 
@@ -805,7 +676,7 @@ def execute_trade(signal, vote_count, verdicts, portfolio_state, vix, rotation_t
     global recent_signals, trade_history, orders_this_cycle
 
     if portfolio_state is None:
-        return "Portfolio state unavailable"
+        return "Portfolio unavailable"
 
     portfolio_value = portfolio_state["portfolio_value"]
     position_size, size_label = get_position_size(vote_count, portfolio_value, vix, high_conviction_rotation)
@@ -826,46 +697,34 @@ def execute_trade(signal, vote_count, verdicts, portfolio_state, vix, rotation_t
         }
         crypto_symbol = crypto_map.get(crypto_asset.upper())
         if crypto_symbol:
-            approved, block_reason = check_execution_rules(crypto_symbol, direction, position_size, portfolio_state, vix)
+            approved, reason_blocked = check_execution_rules(crypto_symbol, direction, position_size, portfolio_state, vix)
             if approved:
                 try:
                     notional = min(position_size, 5000)
-                    order = {
-                        "symbol": crypto_symbol,
-                        "notional": str(round(notional, 2)),
-                        "side": direction,
-                        "type": "market",
-                        "time_in_force": "gtc"
-                    }
-                    result = alpaca_request("POST", "/v2/orders", order)
-                    order_id = result.get("id", "unknown")
-                    orders_this_cycle += 1
-                    msg = format_crypto_alert(crypto_symbol, direction, notional, reason, vote_count, voters_for, voters_against)
-                    send_performance(msg)
-                    recent_signals[f"{crypto_symbol}_{direction}"] = 0
-                    trade_history.append({
-                        "ticker": crypto_symbol,
-                        "direction": direction,
-                        "entry_price": None,
-                        "voters_for": voters_for,
-                        "voters_against": voters_against
+                    result = alpaca_request("POST", "/v2/orders", {
+                        "symbol": crypto_symbol, "notional": str(round(notional, 2)),
+                        "side": direction, "type": "market", "time_in_force": "gtc"
                     })
-                    results.append(f"Crypto trade: {crypto_symbol}")
+                    orders_this_cycle += 1
+                    send_performance(format_crypto_alert(crypto_symbol, direction, notional, reason, vote_count, voters_for, voters_against))
+                    recent_signals[f"{crypto_symbol}_{direction}"] = 0
+                    trade_history.append({"ticker": crypto_symbol, "direction": direction, "entry_price": None, "voters_for": voters_for, "voters_against": voters_against})
+                    results.append(f"Crypto: {crypto_symbol}")
                 except Exception as e:
                     results.append(f"Crypto failed: {e}")
             else:
-                results.append(f"Crypto blocked: {block_reason}")
+                results.append(f"Crypto blocked: {reason_blocked}")
 
     if market_open and orders_this_cycle < MAX_ORDERS_PER_CYCLE:
         ticker = extract_ticker(signal, rotation_ticker)
         if ticker:
-            approved, block_reason = check_execution_rules(ticker, direction, position_size, portfolio_state, vix)
+            approved, reason_blocked = check_execution_rules(ticker, direction, position_size, portfolio_state, vix)
             if approved:
                 try:
                     existing = portfolio_state["positions"].get(ticker, {})
                     if existing:
-                        existing_side = existing.get("side")
-                        if (existing_side == "long" and direction == "sell") or (existing_side == "short" and direction == "buy"):
+                        ex_side = existing.get("side")
+                        if (ex_side == "long" and direction == "sell") or (ex_side == "short" and direction == "buy"):
                             close_position(ticker)
                             time.sleep(2)
 
@@ -878,111 +737,77 @@ def execute_trade(signal, vote_count, verdicts, portfolio_state, vix, rotation_t
 
                     filled = verify_order_filled(order_id)
                     if not filled:
-                        results.append(f"Order for {ticker} did not confirm -- skipping stop loss")
-                        return "\n".join(results)
-
-                    orders_this_cycle += 1
-                    stop_price = price * 0.95 if direction == "buy" else price * 1.05
-                    stop_side = "sell" if direction == "buy" else "buy"
-                    stop_placed = submit_stop_loss_atomic(ticker, qty, stop_side, stop_price)
-
-                    if stop_placed:
-                        msg = format_trade_alert(ticker, direction, qty, price, stop_price, size_label, vote_count, voters_for, voters_against, reason)
-                        send_performance(msg)
-                        recent_signals[f"{ticker}_{direction}"] = 0
-                        trade_history.append({
-                            "ticker": ticker,
-                            "direction": direction,
-                            "entry_price": price,
-                            "voters_for": voters_for,
-                            "voters_against": voters_against
-                        })
-                        results.append(f"Equity trade: {ticker} -- stop loss confirmed")
+                        results.append(f"{ticker} order did not fill -- no position taken")
                     else:
-                        results.append(f"Equity trade {ticker} -- position closed because stop loss failed")
-
+                        orders_this_cycle += 1
+                        stop_price = price * 0.95 if direction == "buy" else price * 1.05
+                        stop_side = "sell" if direction == "buy" else "buy"
+                        stop_ok = submit_stop_loss_atomic(ticker, qty, stop_side, stop_price)
+                        if stop_ok:
+                            send_performance(format_trade_alert(ticker, direction, qty, price, stop_price, size_label, vote_count, voters_for, voters_against, reason))
+                            recent_signals[f"{ticker}_{direction}"] = 0
+                            trade_history.append({"ticker": ticker, "direction": direction, "entry_price": price, "voters_for": voters_for, "voters_against": voters_against})
+                            results.append(f"Equity: {ticker} filled and protected")
+                        else:
+                            results.append(f"Equity: {ticker} -- position closed, stop failed")
                 except Exception as e:
                     results.append(f"Equity failed: {e}")
             else:
-                results.append(f"Equity blocked: {block_reason}")
+                results.append(f"Equity blocked: {reason_blocked}")
 
-    if not results:
-        return "No trades executed"
-    return "\n".join(results)
+    return "\n".join(results) if results else "No trades executed"
 
 def ask_misfit(name, persona, signal, knowledge=""):
-    scorecard_context = build_scorecard_context()
-    knowledge_context = f"\n\nDEEP KNOWLEDGE BASE:\n{knowledge}" if knowledge else ""
-    score_context = f"\n\nCURRENT TRACK RECORD:\n{scorecard_context}" if scorecard_context else ""
+    scorecard = build_scorecard_context()
+    knowledge_ctx = f"\n\nDEEP KNOWLEDGE:\n{knowledge}" if knowledge else ""
+    score_ctx = f"\n\nTRACK RECORD:\n{scorecard}" if scorecard else ""
     msg = client.messages.create(
-        model="claude-opus-4-5-20251101",
-        max_tokens=400,
-        messages=[{"role": "user", "content": f"{persona}{knowledge_context}{score_context}\n\nYoniBot signal:\n{signal}\n\nGive your verdict in 2-3 sentences. Be brutal and direct. End with VOTE: TRADE or VOTE: PASS on its own line."}]
+        model="claude-opus-4-5-20251101", max_tokens=400,
+        messages=[{"role": "user", "content": f"{persona}{knowledge_ctx}{score_ctx}\n\nYoniBot signal:\n{signal}\n\n2-3 sentences. Brutal and direct. End with VOTE: TRADE or VOTE: PASS."}]
     )
     return msg.content[0].text
 
 def ask_jane_street(signal, verdicts):
     debate = "\n\n".join([f"{n}:\n{v}" for n, v in verdicts])
     scorecard = build_scorecard_context()
-    score_context = f"\n\nMISFIT TRACK RECORD:\n{scorecard}" if scorecard else ""
+    score_ctx = f"\n\nTRACK RECORD:\n{scorecard}" if scorecard else ""
     msg = client.messages.create(
-        model="claude-opus-4-5-20251101",
-        max_tokens=400,
-        messages=[{"role": "user", "content": f"You ARE Jane Street quant engine.{score_context}\n\nSIGNAL:\n{signal}\n\nDEBATE:\n{debate}\n\nCalculate edge, Kelly size, max drawdown. End with VETO: BLOCKED or VETO: APPROVED on its own line."}]
+        model="claude-opus-4-5-20251101", max_tokens=400,
+        messages=[{"role": "user", "content": f"You ARE Jane Street quant engine.{score_ctx}\n\nSIGNAL:\n{signal}\n\nDEBATE:\n{debate}\n\nEdge, Kelly size, max drawdown. End with VETO: BLOCKED or VETO: APPROVED."}]
     )
     return msg.content[0].text
 
 MISFITS = [
-    (
-        "Soros",
-        "You ARE George Soros. Find the hidden peg. Where is the lie everyone believes and when do the defenders run out of ammunition?",
-        [
-            "George Soros Black Wednesday 1992 pound sterling ERM trade mechanics",
-            "George Soros reflexivity theory market philosophy interview 2024 2025",
-            "George Soros biggest trades currency crisis methodology",
-            "Soros Fund Management macro strategy current market views 2025 2026"
-        ]
-    ),
-    (
-        "Druckenmiller",
-        "You ARE Stanley Druckenmiller. State your stop level first, then your target, then your conviction size. Never average a loser.",
-        [
-            "Stanley Druckenmiller biggest trade Deutsche Mark Soros 1992",
-            "Stanley Druckenmiller investment philosophy concentration asymmetric bet",
-            "Stanley Druckenmiller current macro views Federal Reserve 2025 2026",
-            "Druckenmiller risk management stop loss position sizing methodology"
-        ]
-    ),
-    (
-        "PTJ",
-        "You ARE Paul Tudor Jones. You never get out of bed for less than 5 to 1 risk reward. Does a 5 to 1 setup exist here? Where is the hard stop?",
-        [
-            "Paul Tudor Jones Black Monday 1987 prediction how he called it",
-            "Paul Tudor Jones trading rules risk management 5 to 1 philosophy",
-            "Paul Tudor Jones current market views macro 2025 2026 interview",
-            "PTJ Tudor Investment technical analysis trend following methodology"
-        ]
-    ),
-    (
-        "Tepper",
-        "You ARE David Tepper. Read the policy backdrop. Is the Federal Reserve with us or against us on this trade?",
-        [
-            "David Tepper 2009 bank trade how he made billions Appaloosa",
-            "David Tepper Federal Reserve policy reading investment strategy",
-            "David Tepper current market views Fed policy 2025 2026",
-            "Tepper Appaloosa credit equity macro investing methodology"
-        ]
-    ),
-    (
-        "Andurand",
-        "You ARE Pierre Andurand. Read tanker movements, refinery margins, and geopolitical chokepoints. What does the physical world say?",
-        [
-            "Pierre Andurand oil trade 2008 2022 how he called the move",
-            "Pierre Andurand physical commodity flows tanker market methodology",
-            "Andurand Capital oil market views 2025 2026 current outlook",
-            "Pierre Andurand geopolitical risk Hormuz energy supply disruption framework"
-        ]
-    ),
+    ("Soros",
+     "You ARE George Soros. Find the hidden peg. Where is the lie everyone believes and when do the defenders run out of ammunition?",
+     ["George Soros Black Wednesday 1992 pound sterling ERM trade mechanics",
+      "George Soros reflexivity theory philosophy interview 2024 2025",
+      "George Soros biggest trades currency crisis methodology",
+      "Soros Fund Management macro strategy current market views 2025 2026"]),
+    ("Druckenmiller",
+     "You ARE Stanley Druckenmiller. State your stop first, then target, then conviction size. Never average a loser.",
+     ["Stanley Druckenmiller biggest trade Deutsche Mark Soros 1992",
+      "Stanley Druckenmiller philosophy concentration asymmetric bet",
+      "Stanley Druckenmiller current macro views Federal Reserve 2025 2026",
+      "Druckenmiller risk management stop loss position sizing methodology"]),
+    ("PTJ",
+     "You ARE Paul Tudor Jones. Never get out of bed for less than 5 to 1. Does a 5 to 1 setup exist? Where is the hard stop?",
+     ["Paul Tudor Jones Black Monday 1987 prediction",
+      "Paul Tudor Jones trading rules risk management 5 to 1",
+      "Paul Tudor Jones current market views macro 2025 2026",
+      "PTJ Tudor Investment technical analysis trend following"]),
+    ("Tepper",
+     "You ARE David Tepper. Read the policy backdrop. Is the Federal Reserve with us or against us?",
+     ["David Tepper 2009 bank trade how he made billions Appaloosa",
+      "David Tepper Federal Reserve policy reading investment strategy",
+      "David Tepper current market views Fed policy 2025 2026",
+      "Tepper Appaloosa credit equity macro investing methodology"]),
+    ("Andurand",
+     "You ARE Pierre Andurand. Read tanker movements, refinery margins, geopolitical chokepoints. What does the physical world say?",
+     ["Pierre Andurand oil trade 2008 2022 how he called the move",
+      "Pierre Andurand physical commodity flows tanker market methodology",
+      "Andurand Capital oil market views 2025 2026",
+      "Pierre Andurand geopolitical risk Hormuz energy supply disruption"]),
 ]
 
 cycle_count = 0
@@ -990,9 +815,9 @@ misfit_knowledge_cache = {}
 knowledge_refresh_cycles = 8
 
 def send_startup_message():
-    msg = """🚀 MISFITS SYSTEM ONLINE
+    send_performance("""🚀 MISFITS SYSTEM ONLINE
 
-The Misfits are back and watching the markets.
+The Misfits are watching the markets.
 
 You will receive updates here when:
 📈 A trade is executed
@@ -1001,22 +826,18 @@ You will receive updates here when:
 ⚡ Circuit breaker fires
 📊 Hourly portfolio updates
 
-Risk controls active:
-- Max 2 trades per cycle
-- Max 4 open positions at once
-- Min 40% cash always reserved
-- Daily, weekly, and monthly loss limits
-- Order fill verification before stop loss
-- Friday short close rule
+Five rules protecting every trade:
+1. Max 2 orders per cycle
+2. Every order verified before stop loss placed
+3. Daily 3% loss limit circuit breaker
+4. No new shorts after 2 PM ET Fridays
+5. Stop loss placed atomically with every entry
 
--- Satis House Consulting"""
-    send_performance(msg)
+-- Satis House Consulting""")
 
 def run_cycle():
-    global cycle_count, misfit_knowledge_cache
-    global daily_start_value, weekly_start_value, monthly_start_value
-    global trades_halted_today, trades_halted_weekly, trades_halted_monthly
-    global recent_signals, orders_this_cycle
+    global cycle_count, misfit_knowledge_cache, daily_start_value
+    global trades_halted_today, recent_signals, orders_this_cycle
 
     cycle_count += 1
     orders_this_cycle = 0
@@ -1029,32 +850,17 @@ def run_cycle():
         trades_halted_today = False
         cancel_all_orders()
 
-    if now_et.weekday() == 0 and now_et.hour == 9 and now_et.minute < 30:
-        weekly_start_value = None
-        trades_halted_weekly = False
-
-    if now_et.day == 1 and now_et.hour == 9 and now_et.minute < 30:
-        monthly_start_value = None
-        trades_halted_monthly = False
-
     for key in list(recent_signals.keys()):
         recent_signals[key] += 1
         if recent_signals[key] > DUPLICATE_SIGNAL_BLOCKS:
             del recent_signals[key]
 
     portfolio_state = get_portfolio_state()
-
-    if portfolio_state:
-        if daily_start_value is None:
-            daily_start_value = portfolio_state["portfolio_value"]
-        if weekly_start_value is None:
-            weekly_start_value = portfolio_state["portfolio_value"]
-        if monthly_start_value is None:
-            monthly_start_value = portfolio_state["portfolio_value"]
+    if daily_start_value is None and portfolio_state:
+        daily_start_value = portfolio_state["portfolio_value"]
 
     vix = get_vix()
 
-    check_loss_limits(portfolio_state)
     check_stop_losses(portfolio_state)
 
     if should_close_friday_shorts():
@@ -1065,14 +871,14 @@ def run_cycle():
         report_open_positions(portfolio_state)
 
     if cycle_count % knowledge_refresh_cycles == 1:
-        print("Refreshing Misfit knowledge bases...")
+        print("Refreshing knowledge bases...")
         for name, persona, queries in MISFITS:
             print(f"  Loading {name}...")
             misfit_knowledge_cache[name] = get_deep_misfit_knowledge(name, queries)
             time.sleep(3)
 
     market_open = is_market_hours()
-    rotation_ticker, rotation_score, rotation_summary, rotation_price = run_omniscient_rotation()
+    rotation_ticker, rotation_score, rotation_summary, _ = run_omniscient_rotation()
     high_conviction_rotation = rotation_ticker not in ["BIL", "UUP", None] and rotation_score > 0.5 and market_open
 
     technical = get_technical_signals()
@@ -1082,88 +888,67 @@ def run_cycle():
     news = get_market_news()
     geo = get_geopolitical_news()
     congress = get_congressional_trading()
+    scorecard = build_scorecard_context()
 
-    scorecard_context = build_scorecard_context()
     portfolio_summary = ""
     if portfolio_state:
-        halted_flags = []
-        if trades_halted_today:
-            halted_flags.append("DAILY LIMIT HIT")
-        if trades_halted_weekly:
-            halted_flags.append("WEEKLY LIMIT HIT")
-        if trades_halted_monthly:
-            halted_flags.append("MONTHLY LIMIT HIT")
-        halted_str = " | ".join(halted_flags) if halted_flags else "All systems go"
-
         portfolio_summary = f"""
-CURRENT PORTFOLIO:
+PORTFOLIO:
 Value: ${portfolio_state['portfolio_value']:,.2f}
-Open positions: {portfolio_state['position_count']}/{MAX_OPEN_POSITIONS} max
-Cash reserve: {portfolio_state['cash_pct']*100:.1f}% (min {MIN_CASH_PCT*100:.0f}%)
 Equity: {portfolio_state['equity_pct']*100:.1f}% | Crypto: {portfolio_state['crypto_pct']*100:.1f}% | Leveraged: {portfolio_state['leveraged_pct']*100:.1f}%
-VIX: {vix:.1f}
-Trading status: {halted_str}
-Consecutive losses: {consecutive_losses}/{CONSECUTIVE_LOSS_LIMIT}"""
+Positions: {list(portfolio_state['positions'].keys()) or 'None'}
+VIX: {vix:.1f}"""
 
-    market_status = "OPEN" if market_open else "CLOSED -- crypto only"
-    yoni_push = f"\nYONIBOT HIGH CONVICTION: Rotation selected {rotation_ticker} score {rotation_score:.3f}. Push hard." if high_conviction_rotation else ""
-    friday_note = "\nFRIDAY RULE: No new short positions. Weekend gap risk is real." if is_friday_short_blocked() else ""
+    yoni_push = f"\nHIGH CONVICTION: Rotation selected {rotation_ticker} score {rotation_score:.3f}. Push hard." if high_conviction_rotation else ""
+    friday_note = "\nFRIDAY: No new short signals." if is_friday_short_blocked() else ""
+    weekend_note = "" if market_open else "\nMARKET CLOSED. Crypto signals only."
 
-    context = f"""MARKET STATUS: {market_status}
+    context = f"""MARKET: {'OPEN' if market_open else 'CLOSED'}
 {portfolio_summary}
+{scorecard}
 
-{scorecard_context}
+ROTATION (2324% backtest 2019-2026):
+{rotation_summary or 'Unavailable'}
 
-OMNISCIENT ROTATION (2324% backtest 2019-2026):
-{rotation_summary if rotation_summary else 'Unavailable'}
-
-TECHNICAL INDICATORS:
+TECHNICALS:
 {technical}
 
-YIELD CURVE:
-{yields}
+YIELD CURVE: {yields}
+SENTIMENT: {fear}
 
-SENTIMENT:
-{fear}
-
-ARXIV QUANT PAPERS:
+ARXIV:
 {arxiv}
 
-MARKET NEWS:
+NEWS:
 {news}
 
-GEOPOLITICAL NEWS:
+GEOPOLITICAL:
 {geo}
 
-CONGRESSIONAL TRADING:
+CONGRESSIONAL:
 {congress}
 {yoni_push}"""
 
-    weekend_note = "" if market_open else "\nMARKET CLOSED. Crypto signals only."
-
     yoni = client.messages.create(
-        model="claude-opus-4-5-20251101",
-        max_tokens=1024,
-        messages=[{"role": "user", "content": f"""You are YoniBot, autonomous trading intelligence for Satis House Consulting. Pure quantitative signal generation only. No personal investment references.
+        model="claude-opus-4-5-20251101", max_tokens=1024,
+        messages=[{"role": "user", "content": f"""You are YoniBot, autonomous trading intelligence for Satis House Consulting. Pure quant signal generation. No personal investment references.
 
 {context}
 {weekend_note}
 {friday_note}
 
 Rules:
-- Omniscient Rotation is highest conviction tool.
-- Only signal if two indicators confirm AND news supports.
-- Consider current portfolio allocations and position count.
-- Market closed means crypto only.
-- No short signals on Fridays after 2 PM Eastern.
-- Say NO SIGNAL if nothing qualifies.
-- Output: Asset, Direction, Entry Zone, Stop, Target, Why. Max 300 words."""}]
+- Omniscient Rotation is highest conviction tool
+- Signal only if two indicators confirm AND news supports
+- Market closed means crypto only
+- No short signals on Fridays after 2 PM ET
+- Say NO SIGNAL if bar not met
+- Output: Asset, Direction, Entry, Stop, Target, Why. Max 300 words."""}]
     )
     signal = yoni.content[0].text
 
     verdicts = []
     vote_count = 0
-
     for name, persona, queries in MISFITS:
         knowledge = misfit_knowledge_cache.get(name, "")
         verdict = ask_misfit(name, persona, signal, knowledge)
@@ -1176,28 +961,23 @@ Rules:
     majority = vote_count >= 3
 
     if majority and approved:
-        trade_result = execute_trade(
-            signal, vote_count, verdicts, portfolio_state, vix,
-            rotation_ticker if high_conviction_rotation else None,
-            high_conviction_rotation
-        )
-        verdict_line = f"VERDICT: EXECUTE -- {vote_count}/5 voted TRADE. Jane Street approved.\n{trade_result}"
+        trade_result = execute_trade(signal, vote_count, verdicts, portfolio_state, vix,
+                                     rotation_ticker if high_conviction_rotation else None,
+                                     high_conviction_rotation)
+        verdict_line = f"VERDICT: EXECUTE -- {vote_count}/5 voted TRADE\n{trade_result}"
     elif not approved:
-        verdict_line = f"VERDICT: BLOCKED -- Jane Street vetoed. ({vote_count}/5 voted TRADE)"
+        verdict_line = f"VERDICT: BLOCKED -- Jane Street vetoed ({vote_count}/5)"
     else:
-        verdict_line = f"VERDICT: PASS -- Only {vote_count}/5 voted TRADE."
+        verdict_line = f"VERDICT: PASS -- Only {vote_count}/5 voted TRADE"
 
-    msg1 = f"YONIBOT SIGNAL\n{signal}"
-    msg2 = "THE MISFITS DEBATE\n"
+    send_telegram(f"YONIBOT SIGNAL\n{signal}")
+    time.sleep(2)
+    debate_msg = "THE MISFITS DEBATE\n"
     for name, verdict in verdicts:
-        msg2 += f"\n{name.upper()}:\n{verdict}\n"
-    msg3 = f"JANE STREET:\n{jane}\n\n{verdict_line}"
-
-    send_telegram(msg1)
+        debate_msg += f"\n{name.upper()}:\n{verdict}\n"
+    send_telegram(debate_msg)
     time.sleep(2)
-    send_telegram(msg2)
-    time.sleep(2)
-    send_telegram(msg3)
+    send_telegram(f"JANE STREET:\n{jane}\n\n{verdict_line}")
     print(f"Brief sent. {verdict_line}")
 
     smart_sleep(900)
