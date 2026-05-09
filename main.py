@@ -34,6 +34,9 @@ DAILY_LOSS_LIMIT = 0.03
 VIX_REDUCE_THRESHOLD = 35
 VIX_STOP_THRESHOLD = 50
 DUPLICATE_SIGNAL_BLOCKS = 2
+FRIDAY_SHORT_CUTOFF_HOUR = 14
+FRIDAY_SHORT_CLOSE_HOUR = 15
+FRIDAY_SHORT_CLOSE_MINUTE = 30
 
 recent_signals = {}
 daily_start_value = None
@@ -115,6 +118,20 @@ Result: {result} ({pnl_pct:+.1f}%)
 
 The Misfits cut the position. Capital protected.
 On to the next signal.
+
+-- Satis House Consulting"""
+
+def format_friday_close_alert(symbol, exit_price, pnl_dollar, pnl_pct):
+    result = f"+${abs(pnl_dollar):,.0f} profit" if pnl_dollar >= 0 else f"-${abs(pnl_dollar):,.0f} loss"
+    return f"""📅 FRIDAY RISK MANAGEMENT
+
+Closed short position in {symbol} before weekend.
+Exit price: ${exit_price:.2f}
+Result: {result} ({pnl_pct:+.1f}%)
+
+Short positions do not survive weekends.
+Weekend gaps can blow through stop losses before markets open Monday.
+Capital protected.
 
 -- Satis House Consulting"""
 
@@ -211,6 +228,35 @@ def is_market_hours():
     market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
     return market_open <= now <= market_close
 
+def is_friday_short_blocked():
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    return now.weekday() == 4 and now.hour >= FRIDAY_SHORT_CUTOFF_HOUR
+
+def should_close_friday_shorts():
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    return now.weekday() == 4 and (now.hour > FRIDAY_SHORT_CLOSE_HOUR or (now.hour == FRIDAY_SHORT_CLOSE_HOUR and now.minute >= FRIDAY_SHORT_CLOSE_MINUTE))
+
+def close_friday_shorts(portfolio_state):
+    if not portfolio_state or not portfolio_state["positions"]:
+        return
+    for symbol, pos in portfolio_state["positions"].items():
+        if pos["side"] == "short":
+            try:
+                close_position(symbol)
+                msg = format_friday_close_alert(
+                    symbol,
+                    pos["current_price"],
+                    pos["unrealized_pnl"],
+                    pos["unrealized_pct"]
+                )
+                send_performance(msg)
+                send_telegram(f"Friday risk management: closed short {symbol} before weekend.")
+                print(f"Friday close: {symbol} short position closed")
+            except Exception as e:
+                print(f"Friday close error for {symbol}: {e}")
+
 def get_vix():
     try:
         vix = yf.download("^VIX", period="1d", interval="1m", progress=False)
@@ -295,6 +341,9 @@ def check_execution_rules(ticker, direction, position_size, portfolio_state, vix
 
     if vix >= VIX_STOP_THRESHOLD:
         return False, "VIX too high for new trades"
+
+    if direction == "sell" and is_friday_short_blocked():
+        return False, "No new shorts after 2 PM ET on Fridays -- weekend gap risk"
 
     signal_key = f"{ticker}_{direction}"
     if signal_key in recent_signals:
@@ -818,6 +867,7 @@ The Misfits are back and watching the markets.
 You will receive updates here when:
 📈 A trade is executed
 🛑 A stop loss triggers
+📅 Friday shorts closed before weekend
 📊 Hourly portfolio updates
 
 The system trades automatically based on signals from five legendary trading minds: Soros, Druckenmiller, PTJ, Tepper, and Andurand. Jane Street approves every trade.
@@ -850,6 +900,10 @@ def run_cycle():
 
     check_stop_losses(portfolio_state)
 
+    if should_close_friday_shorts():
+        close_friday_shorts(portfolio_state)
+        portfolio_state = get_portfolio_state()
+
     if cycle_count % 4 == 0:
         report_open_positions(portfolio_state)
 
@@ -880,7 +934,8 @@ CURRENT PORTFOLIO:
 Value: ${portfolio_state['portfolio_value']:,.2f}
 Equity: {portfolio_state['equity_pct']*100:.1f}% | Crypto: {portfolio_state['crypto_pct']*100:.1f}% | Leveraged: {portfolio_state['leveraged_pct']*100:.1f}%
 Open positions: {', '.join(portfolio_state['positions'].keys()) if portfolio_state['positions'] else 'None'}
-VIX: {vix:.1f}"""
+VIX: {vix:.1f}
+Friday short rule: {'ACTIVE -- no new shorts after 2 PM ET' if is_friday_short_blocked() else 'Standard trading rules'}"""
 
     market_status = "OPEN" if market_open else "CLOSED -- crypto only"
     yoni_push = f"\nYONIBOT HIGH CONVICTION: Rotation selected {rotation_ticker} score {rotation_score:.3f}. Push hard." if high_conviction_rotation else ""
@@ -916,6 +971,7 @@ CONGRESSIONAL TRADING:
 {yoni_push}"""
 
     weekend_note = "" if market_open else "\nMARKET CLOSED. Crypto signals only."
+    friday_note = "\nFRIDAY RULE: No new short positions. Weekend gap risk is real." if is_friday_short_blocked() else ""
 
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
@@ -924,12 +980,14 @@ CONGRESSIONAL TRADING:
 
 {context}
 {weekend_note}
+{friday_note}
 
 Rules:
 - Omniscient Rotation is highest conviction tool.
 - Only signal if two indicators confirm AND news supports.
 - Consider current portfolio allocations.
 - Market closed means crypto only.
+- No short signals on Fridays after 2 PM Eastern -- weekend gap risk.
 - Say NO SIGNAL if nothing qualifies.
 - Output: Asset, Direction, Entry Zone, Stop, Target, Why. Max 300 words."""}]
     )
