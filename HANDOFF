@@ -1,0 +1,62 @@
+# YoniBot and The Misfits -- System Handoff
+Last updated: May 9 2026
+
+## Two Systems Running
+
+### System 1 -- YoniBot and The Misfits
+- Railway: github.com/horant2/yonibot-scheduler
+- Alpaca: original paper account, $100K
+- Telegram signals: TitoWHACK_bot
+- Telegram performance: MisfitsPerformance_bot, chat ID -5111730059
+- Nine Claude Console agents: YoniBot, SorosBot, Druckenmiller, PTJ, Tepper, Andurand, Jane Street, OmniscientBot
+
+### System 2 -- OmniscientBot Pure Rotation
+- Railway: github.com/horant2/omniscient-scheduler
+- Alpaca: second paper account
+- Telegram: same channels as System 1
+- Strategy: TheOmniscientParadox, 2324% backtest 2019-2026
+
+## Execution Architecture (System 1)
+Seven rules enforced before every trade:
+1. Position awareness -- no duplicate positions in same asset same direction
+2. Market hours routing -- equities and leveraged ETFs only 9:30-4:00 ET weekdays
+3. Allocation limits -- equity 40%, crypto 20%, leveraged ETF 30%, single position 15%
+4. Direction conflict -- close existing position before reversing
+5. Daily loss limit -- 3% drawdown halts all trading for the day
+6. VIX circuit breaker -- reduce size 50% above 35, stop equity trading above 50
+7. Duplicate signal prevention -- same signal blocked for 2 cycles after execution
+
+## Execution Architecture (System 2)
+- Market hours only for all rotations
+- Cancel stale orders at 9:30 AM daily
+- Read actual Alpaca positions before deciding to rotate
+- Single asset at a time, BIL as safe haven
+
+## Railway Variables (yonibot-scheduler)
+ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+TELEGRAM_PERFORMANCE_TOKEN, TELEGRAM_PERFORMANCE_CHAT_ID,
+FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY, EXA_API_KEY,
+ALPACA_API_KEY, ALPACA_SECRET_KEY
+
+## Railway Variables (omniscient-scheduler)
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+ALPACA_API_KEY (new account), ALPACA_SECRET_KEY (new account)
+
+## Three Gaps Still Open
+1. Training loop -- feed closed trade outcomes back to weight Misfits by win rate. Free to build. Needs 10 closed trades first.
+2. Unusual Whales API -- options flow and dark pool data. $125/mo. Wait until paper trading proves edge.
+3. Memory Store connection -- Misfits Memory Store exists on Claude Console but agent attachment not yet supported in UI.
+
+## Next Build List
+1. Telegram command interface -- send commands to YoniBot from Telegram
+2. Training loop -- outcome feedback into Misfits context
+3. QuantConnect validation of Misfits signal history
+4. Unusual Whales wire-in when account goes live
+5. Options execution -- live when Alpaca identity verification approves
+
+## Monday Morning Checklist
+- Check Alpaca identity verification status
+- Review paper trading results from weekend
+- Compare OmniscientBot vs Misfits performance
+- Check Railway usage and costs
+- Review any EXECUTE verdicts and outcomes
