@@ -21,6 +21,8 @@ ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 
+INCEPTION_VALUE = 100000
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 exa = Exa(api_key=EXA_API_KEY)
 
@@ -117,31 +119,37 @@ On to the next signal.
 -- Satis House Consulting"""
 
 def format_position_report(portfolio_state, daily_pnl=None):
+    portfolio_value = portfolio_state["portfolio_value"] if portfolio_state else INCEPTION_VALUE
+    net_profit = portfolio_value - INCEPTION_VALUE
+    net_pct = (net_profit / INCEPTION_VALUE) * 100
+    profit_emoji = "📈" if net_profit >= 0 else "📉"
+    net_profit_line = f"{profit_emoji} Net profit since inception: {'+' if net_profit >= 0 else ''}${net_profit:,.0f} ({'+' if net_pct >= 0 else ''}{net_pct:.2f}%)"
+
     if not portfolio_state or not portfolio_state["positions"]:
         return f"""📊 MISFITS PORTFOLIO UPDATE
 
 No open positions right now.
 Sitting in cash, waiting for the right signal.
 
-Cash available: ${portfolio_state['portfolio_value']:,.0f}
+Total value: ${portfolio_value:,.0f}
+{net_profit_line}
 
 -- Satis House Consulting"""
 
     lines = ["📊 MISFITS PORTFOLIO UPDATE\n"]
-    lines.append(f"Total value: ${portfolio_state['portfolio_value']:,.2f}")
+    lines.append(f"Total value: ${portfolio_value:,.2f}")
 
     if daily_pnl is not None:
         daily_emoji = "📈" if daily_pnl >= 0 else "📉"
-        lines.append(f"Today: {daily_emoji} {'+' if daily_pnl >= 0 else ''}{daily_pnl*100:.2f}%\n")
+        lines.append(f"Today: {daily_emoji} {'+' if daily_pnl >= 0 else ''}{daily_pnl*100:.2f}%")
 
-    lines.append("Open positions:")
+    lines.append("\nOpen positions:")
     for symbol, pos in portfolio_state["positions"].items():
         pnl_emoji = "✅" if pos["unrealized_pnl"] >= 0 else "⚠️"
         direction = "Long" if pos["side"] == "long" else "Short"
         lines.append(f"{pnl_emoji} {symbol} ({direction}) -- {'+' if pos['unrealized_pnl'] >= 0 else ''}{pos['unrealized_pct']:.1f}% since entry")
 
-    buying_power = portfolio_state.get("buying_power", 0)
-    lines.append(f"\nCash available: ${buying_power:,.0f}")
+    lines.append(f"\n{net_profit_line}")
     lines.append("\n-- Satis House Consulting")
     return "\n".join(lines)
 
@@ -286,7 +294,7 @@ def check_execution_rules(ticker, direction, position_size, portfolio_state, vix
             return False, "Daily loss limit triggered"
 
     if vix >= VIX_STOP_THRESHOLD:
-        return False, f"VIX too high for new trades"
+        return False, "VIX too high for new trades"
 
     signal_key = f"{ticker}_{direction}"
     if signal_key in recent_signals:
@@ -802,6 +810,21 @@ cycle_count = 0
 misfit_knowledge_cache = {}
 knowledge_refresh_cycles = 8
 
+def send_startup_message():
+    msg = """🚀 MISFITS SYSTEM ONLINE
+
+The Misfits are back and watching the markets.
+
+You will receive updates here when:
+📈 A trade is executed
+🛑 A stop loss triggers
+📊 Hourly portfolio updates
+
+The system trades automatically based on signals from five legendary trading minds: Soros, Druckenmiller, PTJ, Tepper, and Andurand. Jane Street approves every trade.
+
+-- Satis House Consulting"""
+    send_performance(msg)
+
 def run_cycle():
     global cycle_count, misfit_knowledge_cache, daily_start_value, trades_halted_today, recent_signals
 
@@ -952,21 +975,6 @@ Rules:
     print(f"Brief sent. {verdict_line}")
 
     smart_sleep(900)
-
-def send_startup_message():
-    msg = """🚀 MISFITS SYSTEM ONLINE
-
-The Misfits are back and watching the markets.
-
-You will receive updates here when:
-📈 A trade is executed
-🛑 A stop loss triggers
-📊 Hourly portfolio updates
-
-The system trades automatically based on signals from five legendary trading minds: Soros, Druckenmiller, PTJ, Tepper, and Andurand. Jane Street approves every trade.
-
--- Satis House Consulting"""
-    send_performance(msg)
 
 while True:
     try:
