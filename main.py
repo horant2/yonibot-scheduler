@@ -36,9 +36,21 @@ DUPLICATE_SIGNAL_BLOCKS = 2
 recent_signals = {}
 daily_start_value = None
 trades_halted_today = False
+last_update_id = 0
 
 LEVERAGED_ETFS = {"TQQQ", "SOXL", "TECL", "FAS", "ERX", "TMF", "SPXL", "UPRO"}
 CRYPTO_ASSETS = {"BTC/USD", "ETH/USD", "SOL/USD"}
+
+misfit_scorecard = {
+    "Soros": {"correct": 0, "total": 0},
+    "Druckenmiller": {"correct": 0, "total": 0},
+    "PTJ": {"correct": 0, "total": 0},
+    "Tepper": {"correct": 0, "total": 0},
+    "Andurand": {"correct": 0, "total": 0},
+    "Jane Street": {"correct": 0, "total": 0}
+}
+
+trade_history = []
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -53,6 +65,176 @@ def send_performance(message):
     for chunk in chunks:
         requests.post(url, json={"chat_id": TELEGRAM_PERFORMANCE_CHAT_ID, "text": chunk})
         time.sleep(1)
+
+def format_trade_alert(ticker, direction, qty, price, stop_price, size_label, vote_count, voters_for, voters_against, reason):
+    action = "Bought" if direction == "buy" else "Sold Short"
+    total_bet = qty * price
+    emoji = "🟢" if direction == "buy" else "🔴"
+    return f"""{emoji} THE MISFITS JUST TRADED
+
+{action} {qty} shares of {ticker} at ${price:.2f}
+Bet size: ${total_bet:,.0f} ({size_label})
+Stop loss set at: ${stop_price:.2f}
+
+Why: {reason}
+
+Who agreed ({vote_count}/5): {', '.join(voters_for)}
+Who disagreed: {', '.join(voters_against) if voters_against else 'Nobody'}
+Jane Street approved the math.
+
+-- Satis House Consulting"""
+
+def format_crypto_alert(crypto_symbol, direction, notional, reason, vote_count, voters_for, voters_against):
+    action = "Bought" if direction == "buy" else "Sold"
+    emoji = "🟢" if direction == "buy" else "🔴"
+    return f"""{emoji} THE MISFITS JUST TRADED CRYPTO
+
+{action} ${notional:,.0f} of {crypto_symbol}
+Markets are closed but crypto never sleeps.
+
+Why: {reason}
+
+Who agreed ({vote_count}/5): {', '.join(voters_for)}
+Who disagreed: {', '.join(voters_against) if voters_against else 'Nobody'}
+Jane Street approved the math.
+
+-- Satis House Consulting"""
+
+def format_stop_loss_alert(symbol, exit_price, pnl_dollar, pnl_pct):
+    emoji = "🛑"
+    result = f"+${pnl_dollar:,.0f} profit" if pnl_dollar >= 0 else f"-${abs(pnl_dollar):,.0f} loss"
+    return f"""{emoji} STOP LOSS TRIGGERED
+
+Closed {symbol} position
+Exit price: ${exit_price:.2f}
+Result: {result} ({pnl_pct:+.1f}%)
+
+The Misfits cut the position. Capital protected.
+On to the next signal.
+
+-- Satis House Consulting"""
+
+def format_position_report(portfolio_state, daily_pnl=None):
+    if not portfolio_state or not portfolio_state["positions"]:
+        return f"""📊 MISFITS PORTFOLIO UPDATE
+
+No open positions right now.
+Sitting in cash, waiting for the right signal.
+
+Cash available: ${portfolio_state['portfolio_value']:,.0f}
+
+-- Satis House Consulting"""
+
+    lines = [f"📊 MISFITS PORTFOLIO UPDATE\n"]
+    lines.append(f"Total value: ${portfolio_state['portfolio_value']:,.2f}")
+
+    if daily_pnl is not None:
+        daily_emoji = "📈" if daily_pnl >= 0 else "📉"
+        lines.append(f"Today: {daily_emoji} {'+' if daily_pnl >= 0 else ''}{daily_pnl*100:.2f}%\n")
+
+    lines.append("Open positions:")
+    for symbol, pos in portfolio_state["positions"].items():
+        pnl_emoji = "✅" if pos["unrealized_pnl"] >= 0 else "⚠️"
+        direction = "Long" if pos["side"] == "long" else "Short"
+        lines.append(f"{pnl_emoji} {symbol} ({direction}) -- {'+' if pos['unrealized_pnl'] >= 0 else ''}{pos['unrealized_pct']:.1f}% since entry")
+
+    buying_power = portfolio_state.get("buying_power", 0)
+    lines.append(f"\nCash available: ${buying_power:,.0f}")
+    lines.append("\n-- Satis House Consulting")
+    return "\n".join(lines)
+
+def format_no_signal_message():
+    et = pytz.timezone("America/New_York")
+    now = datetime.now(et)
+    market_status = "Markets are open" if (now.weekday() < 5 and 9 <= now.hour < 16) else "Markets are closed"
+    return f"""👀 THE MISFITS REVIEWED THE MARKETS
+
+{market_status}. No trade this cycle.
+The bar was not high enough. Capital is protected.
+
+The Misfits only trade when the signal is real.
+
+-- Satis House Consulting"""
+
+def format_scorecard():
+    lines = ["🏆 MISFIT SCORECARD\n"]
+    for name, scores in misfit_scorecard.items():
+        total = scores["total"]
+        if total > 0:
+            win_rate = scores["correct"] / total * 100
+            lines.append(f"{name}: {scores['correct']}/{total} correct ({win_rate:.0f}% win rate)")
+        else:
+            lines.append(f"{name}: No trades yet")
+    lines.append("\n-- Satis House Consulting")
+    return "\n".join(lines)
+
+def get_telegram_updates():
+    global last_update_id
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_PERFORMANCE_TOKEN}/getUpdates"
+        params = {"offset": last_update_id + 1, "timeout": 1}
+        response = requests.get(url, params=params, timeout=5).json()
+        if response.get("ok") and response.get("result"):
+            return response["result"]
+        return []
+    except:
+        return []
+
+def handle_telegram_commands(portfolio_state, vix):
+    global last_update_id, trades_halted_today
+    updates = get_telegram_updates()
+    for update in updates:
+        last_update_id = update["update_id"]
+        message = update.get("message", {})
+        text = message.get("text", "").strip().lower()
+        chat_id = message.get("chat", {}).get("id")
+        if not text or not chat_id:
+            continue
+
+        if text in ["/positions", "positions", "show positions"]:
+            daily_pnl = None
+            if daily_start_value and portfolio_state:
+                daily_pnl = (portfolio_state["portfolio_value"] - daily_start_value) / daily_start_value
+            send_performance(format_position_report(portfolio_state, daily_pnl))
+
+        elif text in ["/scorecard", "scorecard", "scores", "who is winning"]:
+            send_performance(format_scorecard())
+
+        elif text in ["/vix", "vix"]:
+            vix_status = "Low -- normal trading" if vix < 20 else ("Elevated -- reduced position sizes" if vix < 35 else ("High -- position sizes cut 50%" if vix < 50 else "Extreme -- equity trading paused"))
+            send_performance(f"📊 VIX (Market Fear Index)\n\nCurrent VIX: {vix:.1f}\nStatus: {vix_status}\n\n-- Satis House Consulting")
+
+        elif text in ["/pause", "pause", "pause trading", "stop trading"]:
+            trades_halted_today = True
+            send_performance("⏸ TRADING PAUSED\n\nThe Misfits will not execute any new trades until tomorrow morning.\nExisting positions remain open.\n\n-- Satis House Consulting")
+
+        elif text in ["/resume", "resume", "resume trading", "start trading"]:
+            trades_halted_today = False
+            send_performance("▶️ TRADING RESUMED\n\nThe Misfits are back on watch.\n\n-- Satis House Consulting")
+
+        elif text in ["/rotation", "rotation", "rotation scores"]:
+            send_performance("🔄 Running rotation scan... check the main channel for the next brief.")
+
+        elif text in ["/help", "help", "commands", "what can you do"]:
+            help_text = """🤖 MISFITS COMMAND CENTER
+
+Send any of these messages to control the system:
+
+/positions -- Show current holdings and profit/loss
+/scorecard -- See which Misfits have been right
+/vix -- Check market fear level
+/pause -- Stop new trades (keeps existing positions)
+/resume -- Restart trading after pause
+/rotation -- Show current momentum scores
+/help -- Show this menu
+
+The Misfits trade automatically every 15 minutes when they find a signal strong enough.
+
+-- Satis House Consulting"""
+            send_performance(help_text)
+
+        else:
+            send_performance(f"I received your message but did not understand the command.\n\nSend /help to see what I can do.\n\n-- Satis House Consulting")
 
 def alpaca_request(method, endpoint, data=None, params=None):
     headers = {
@@ -128,7 +310,6 @@ def get_portfolio_state():
         positions = get_positions()
         portfolio_value = float(account.get("portfolio_value", 100000))
         buying_power = float(account.get("buying_power", 50000))
-        equity = float(account.get("equity", 100000))
 
         position_map = {}
         equity_value = 0
@@ -157,7 +338,7 @@ def get_portfolio_state():
                     "pct_of_portfolio": abs(market_val) / portfolio_value if portfolio_value > 0 else 0
                 }
 
-                if symbol in CRYPTO_ASSETS or "USD" in symbol:
+                if "USD" in symbol:
                     crypto_value += abs(market_val)
                 elif symbol in LEVERAGED_ETFS:
                     leveraged_value += abs(market_val)
@@ -167,7 +348,6 @@ def get_portfolio_state():
         return {
             "portfolio_value": portfolio_value,
             "buying_power": buying_power,
-            "equity": equity,
             "positions": position_map,
             "equity_value": equity_value,
             "crypto_value": crypto_value,
@@ -181,7 +361,7 @@ def get_portfolio_state():
         return None
 
 def check_execution_rules(ticker, direction, position_size, portfolio_state, vix):
-    global trades_halted_today, daily_start_value, recent_signals
+    global trades_halted_today, daily_start_value
 
     if portfolio_state is None:
         return False, "Portfolio state unavailable"
@@ -190,57 +370,87 @@ def check_execution_rules(ticker, direction, position_size, portfolio_state, vix
     positions = portfolio_state["positions"]
 
     if trades_halted_today:
-        return False, "Trades halted -- daily loss limit hit"
+        return False, "Trading paused"
 
     if daily_start_value is not None:
         daily_pnl_pct = (portfolio_value - daily_start_value) / daily_start_value
         if daily_pnl_pct <= -DAILY_LOSS_LIMIT:
             trades_halted_today = True
-            send_telegram(f"CIRCUIT BREAKER: Daily loss limit hit. Portfolio down {daily_pnl_pct*100:.1f}%. All trading halted for today.")
-            send_performance(f"CIRCUIT BREAKER TRIGGERED\nDaily loss: {daily_pnl_pct*100:.1f}%\nTime: {datetime.now(pytz.timezone('America/New_York')).strftime('%Y-%m-%d %H:%M ET')}")
+            send_performance(f"🛑 DAILY LOSS LIMIT HIT\n\nThe portfolio is down {abs(daily_pnl_pct)*100:.1f}% today.\nAll trading paused until tomorrow to protect capital.\n\n-- Satis House Consulting")
             return False, "Daily loss limit triggered"
 
     if vix >= VIX_STOP_THRESHOLD:
-        return False, f"VIX at {vix:.1f} -- above {VIX_STOP_THRESHOLD} threshold. No new equity trades."
+        return False, f"VIX at {vix:.1f} -- too dangerous for new equity trades"
 
     signal_key = f"{ticker}_{direction}"
     if signal_key in recent_signals:
-        cycles_since = recent_signals[signal_key]
-        if cycles_since < DUPLICATE_SIGNAL_BLOCKS:
-            return False, f"Duplicate signal blocked -- same trade executed {cycles_since} cycles ago"
+        if recent_signals[signal_key] < DUPLICATE_SIGNAL_BLOCKS:
+            return False, f"Same trade attempted recently -- waiting for new signal"
 
     if ticker in positions:
         existing = positions[ticker]
-        existing_side = existing["side"]
-        if existing_side == "long" and direction == "buy":
-            return False, f"Already long {ticker} -- no duplicate long"
-        if existing_side == "short" and direction == "sell":
-            return False, f"Already short {ticker} -- no duplicate short"
+        if existing["side"] == "long" and direction == "buy":
+            return False, f"Already holding {ticker} long"
+        if existing["side"] == "short" and direction == "sell":
+            return False, f"Already short {ticker}"
 
     is_crypto = any(c in ticker.upper() for c in ["BTC", "ETH", "SOL"])
     is_leveraged = ticker in LEVERAGED_ETFS
 
     if is_leveraged and not is_market_hours():
-        return False, f"{ticker} is a leveraged ETF -- only trades during market hours"
+        return False, f"{ticker} only trades during market hours"
 
     if not is_crypto and not is_market_hours():
-        return False, f"Market closed -- {ticker} is equity, not crypto"
+        return False, f"Market closed -- waiting for Monday"
 
-    max_position = portfolio_value * MAX_POSITION_PCT
-    if position_size > max_position:
-        position_size = max_position
-
-    if is_leveraged:
-        if portfolio_state["leveraged_pct"] >= MAX_LEVERAGED_PCT:
-            return False, f"Leveraged ETF allocation at {portfolio_state['leveraged_pct']*100:.1f}% -- max is {MAX_LEVERAGED_PCT*100:.0f}%"
-    elif is_crypto:
-        if portfolio_state["crypto_pct"] >= MAX_CRYPTO_PCT:
-            return False, f"Crypto allocation at {portfolio_state['crypto_pct']*100:.1f}% -- max is {MAX_CRYPTO_PCT*100:.0f}%"
-    else:
-        if portfolio_state["equity_pct"] >= MAX_EQUITY_PCT:
-            return False, f"Equity allocation at {portfolio_state['equity_pct']*100:.1f}% -- max is {MAX_EQUITY_PCT*100:.0f}%"
+    if is_leveraged and portfolio_state["leveraged_pct"] >= MAX_LEVERAGED_PCT:
+        return False, f"Already at max leveraged ETF allocation"
+    elif is_crypto and portfolio_state["crypto_pct"] >= MAX_CRYPTO_PCT:
+        return False, f"Already at max crypto allocation"
+    elif not is_crypto and not is_leveraged and portfolio_state["equity_pct"] >= MAX_EQUITY_PCT:
+        return False, f"Already at max equity allocation"
 
     return True, "All checks passed"
+
+def update_training_loop(trade_record, outcome_pnl_pct):
+    global misfit_scorecard, trade_history
+    voters_for = trade_record.get("voters_for", [])
+    voters_against = trade_record.get("voters_against", [])
+    trade_was_profitable = outcome_pnl_pct > 0
+
+    for name in voters_for:
+        if name in misfit_scorecard:
+            misfit_scorecard[name]["total"] += 1
+            if trade_was_profitable:
+                misfit_scorecard[name]["correct"] += 1
+
+    for name in voters_against:
+        if name in misfit_scorecard:
+            misfit_scorecard[name]["total"] += 1
+            if not trade_was_profitable:
+                misfit_scorecard[name]["correct"] += 1
+
+    trade_history.append({
+        "ticker": trade_record.get("ticker"),
+        "direction": trade_record.get("direction"),
+        "entry": trade_record.get("entry_price"),
+        "outcome_pct": outcome_pnl_pct,
+        "profitable": trade_was_profitable,
+        "voters_for": voters_for,
+        "voters_against": voters_against,
+        "timestamp": datetime.now(pytz.utc).isoformat()
+    })
+
+def build_scorecard_context():
+    lines = []
+    for name, scores in misfit_scorecard.items():
+        total = scores["total"]
+        if total > 0:
+            win_rate = scores["correct"] / total * 100
+            lines.append(f"{name}: {win_rate:.0f}% win rate ({scores['correct']}/{total} trades)")
+    if lines:
+        return "MISFIT TRACK RECORD:\n" + "\n".join(lines)
+    return ""
 
 def keepalive():
     try:
@@ -258,6 +468,7 @@ def smart_sleep(total_seconds):
         elapsed += sleep_chunk
         if elapsed < total_seconds:
             keepalive()
+            handle_telegram_commands(None, 20.0)
 
 def calc_rsi(series, period=14):
     delta = series.diff()
@@ -449,15 +660,15 @@ def get_position_size(vote_count, portfolio_value, vix, high_conviction_rotation
     base_pct = 0.15 if high_conviction_rotation else (0.10 if vote_count == 5 else (0.08 if vote_count == 4 else 0.05))
     if vix >= VIX_REDUCE_THRESHOLD:
         base_pct = base_pct * 0.5
-        label = f"REDUCED SIZE (VIX={vix:.0f}) -- {base_pct*100:.0f}% of portfolio"
+        label = f"reduced size due to high volatility ({base_pct*100:.0f}% of portfolio)"
     elif high_conviction_rotation:
-        label = "ROTATION CONVICTION -- 15% of portfolio"
+        label = "15% of portfolio -- rotation conviction"
     elif vote_count == 5:
-        label = "MAXIMUM CONVICTION -- 10% of portfolio"
+        label = "10% of portfolio -- maximum conviction"
     elif vote_count == 4:
-        label = "HIGH CONVICTION -- 8% of portfolio"
+        label = "8% of portfolio -- high conviction"
     else:
-        label = "BASE CONVICTION -- 5% of portfolio"
+        label = "5% of portfolio -- base conviction"
     size = min(portfolio_value * base_pct, 15000)
     return size, label
 
@@ -466,37 +677,34 @@ def check_stop_losses(portfolio_state):
         if portfolio_state is None:
             return
         positions = portfolio_state["positions"]
-        closed = []
         for symbol, pos in positions.items():
             unrealized_pct = pos["unrealized_pct"]
             side = pos["side"]
             current_price = pos["current_price"]
-            qty = pos["qty"]
+            entry_price = pos["avg_entry"]
+            unrealized_pnl = pos["unrealized_pnl"]
             stop_triggered = (side == "long" and unrealized_pct <= -5) or (side == "short" and unrealized_pct <= -5)
             if stop_triggered:
                 close_position(symbol)
-                msg = f"STOP LOSS HIT\nSymbol: {symbol}\nPrice: ${current_price:.2f}\nLoss: {unrealized_pct:.1f}%\nTime: {datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-                closed.append(msg)
+                msg = format_stop_loss_alert(symbol, current_price, unrealized_pnl, unrealized_pct)
                 send_performance(msg)
-        if closed:
-            send_telegram("STOP LOSS TRIGGERED\n" + "\n".join(closed))
+                send_telegram(f"Stop loss hit on {symbol}. See performance channel for details.")
+                for trade in reversed(trade_history):
+                    if trade.get("ticker") == symbol and trade.get("outcome_pct") is None:
+                        update_training_loop(trade, unrealized_pct / 100)
+                        break
     except Exception as e:
         print(f"Stop loss check error: {e}")
 
 def report_open_positions(portfolio_state):
     try:
-        if portfolio_state is None or not portfolio_state["positions"]:
+        if portfolio_state is None:
             return
-        report = f"OPEN POSITIONS -- {datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
-        report += f"Portfolio Value: ${portfolio_state['portfolio_value']:,.2f}\n"
-        report += f"Equity: {portfolio_state['equity_pct']*100:.1f}% | Crypto: {portfolio_state['crypto_pct']*100:.1f}% | Leveraged: {portfolio_state['leveraged_pct']*100:.1f}%\n\n"
-        for symbol, pos in portfolio_state["positions"].items():
-            pnl_color = "+" if pos["unrealized_pnl"] >= 0 else ""
-            report += f"{symbol} ({pos['side'].upper()}): {pos['qty']} units\n"
-            report += f"Entry: ${pos['avg_entry']:.2f} | Now: ${pos['current_price']:.2f}\n"
-            report += f"P&L: {pnl_color}${pos['unrealized_pnl']:.2f} ({pnl_color}{pos['unrealized_pct']:.1f}%)\n"
-            report += f"Portfolio weight: {pos['pct_of_portfolio']*100:.1f}%\n\n"
-        send_performance(report)
+        daily_pnl = None
+        if daily_start_value and portfolio_state:
+            daily_pnl = (portfolio_state["portfolio_value"] - daily_start_value) / daily_start_value
+        msg = format_position_report(portfolio_state, daily_pnl)
+        send_performance(msg)
     except Exception as e:
         print(f"Position report error: {e}")
 
@@ -520,43 +728,55 @@ def extract_direction(signal):
         return "sell"
     return "buy"
 
-def execute_trade(signal, vote_count, portfolio_state, vix, rotation_ticker=None, high_conviction_rotation=False):
-    global recent_signals
+def extract_reason(signal):
+    lines = signal.strip().split("\n")
+    for line in lines:
+        if any(word in line.lower() for word in ["because", "thesis", "signal", "confirmed", "why"]):
+            return line.strip()
+    return lines[0].strip() if lines else "Multiple indicators confirmed"
+
+def execute_trade(signal, vote_count, verdicts, portfolio_state, vix, rotation_ticker=None, high_conviction_rotation=False):
+    global recent_signals, trade_history
 
     if portfolio_state is None:
-        return "Portfolio state unavailable -- trade skipped"
+        return "Portfolio state unavailable -- trade skipped", [], []
 
     portfolio_value = portfolio_state["portfolio_value"]
     position_size, size_label = get_position_size(vote_count, portfolio_value, vix, high_conviction_rotation)
     direction = extract_direction(signal)
+    reason = extract_reason(signal)
     market_open = is_market_hours()
     results = []
+
+    voters_for = [name for name, verdict in verdicts if "VOTE: TRADE" in verdict]
+    voters_against = [name for name, verdict in verdicts if "VOTE: PASS" in verdict]
 
     crypto_asset = extract_crypto(signal)
     if crypto_asset:
         crypto_map = {"BTC": "BTC/USD", "BITCOIN": "BTC/USD", "ETH": "ETH/USD", "ETHEREUM": "ETH/USD", "SOL": "SOL/USD", "SOLANA": "SOL/USD"}
         crypto_symbol = crypto_map.get(crypto_asset.upper())
         if crypto_symbol:
-            approved, reason = check_execution_rules(crypto_symbol, direction, position_size, portfolio_state, vix)
+            approved, block_reason = check_execution_rules(crypto_symbol, direction, position_size, portfolio_state, vix)
             if approved:
                 try:
                     notional = min(position_size, 5000)
                     order = {"symbol": crypto_symbol, "notional": str(round(notional, 2)), "side": direction, "type": "market", "time_in_force": "gtc"}
                     result = alpaca_request("POST", "/v2/orders", order)
                     order_id = result.get("id", "unknown")
-                    msg = f"CRYPTO TRADE: {direction.upper()} ${notional:.0f} of {crypto_symbol}\nOrder ID: {order_id}"
-                    results.append(msg)
+                    msg = format_crypto_alert(crypto_symbol, direction, notional, reason, vote_count, voters_for, voters_against)
+                    send_performance(msg)
                     recent_signals[f"{crypto_symbol}_{direction}"] = 0
-                    send_performance(f"NEW CRYPTO TRADE\nTime: {datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M UTC')}\n{msg}\nSize: {size_label}")
+                    trade_history.append({"ticker": crypto_symbol, "direction": direction, "entry_price": None, "voters_for": voters_for, "voters_against": voters_against, "outcome_pct": None})
+                    results.append(f"Crypto trade executed: {crypto_symbol}")
                 except Exception as e:
                     results.append(f"Crypto execution failed: {e}")
             else:
-                results.append(f"Crypto blocked: {reason}")
+                results.append(f"Crypto blocked: {block_reason}")
 
     if market_open:
         ticker = extract_ticker(signal, rotation_ticker)
         if ticker:
-            approved, reason = check_execution_rules(ticker, direction, position_size, portfolio_state, vix)
+            approved, block_reason = check_execution_rules(ticker, direction, position_size, portfolio_state, vix)
             if approved:
                 try:
                     existing = portfolio_state["positions"].get(ticker, {})
@@ -565,7 +785,6 @@ def execute_trade(signal, vote_count, portfolio_state, vix, rotation_ticker=None
                         if (existing_side == "long" and direction == "sell") or (existing_side == "short" and direction == "buy"):
                             close_position(ticker)
                             time.sleep(1)
-                            send_performance(f"POSITION CLOSED before reversal: {ticker}")
 
                     price_data = yf.download(ticker, period="1d", interval="1m", progress=False)
                     price = float(price_data["Close"].squeeze().iloc[-1])
@@ -575,36 +794,40 @@ def execute_trade(signal, vote_count, portfolio_state, vix, rotation_ticker=None
                     stop_price = price * 0.95 if direction == "buy" else price * 1.05
                     stop_side = "sell" if direction == "buy" else "buy"
                     submit_stop_loss(ticker, qty, stop_side, stop_price)
-                    msg = f"EQUITY TRADE: {direction.upper()} {qty} shares {ticker} at ~${price:.2f}\nStop: ${stop_price:.2f}\nSize: {size_label}\nOrder ID: {order_id}"
-                    results.append(msg)
+
+                    msg = format_trade_alert(ticker, direction, qty, price, stop_price, size_label, vote_count, voters_for, voters_against, reason)
+                    send_performance(msg)
                     recent_signals[f"{ticker}_{direction}"] = 0
-                    send_performance(f"NEW EQUITY TRADE\nTime: {datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M UTC')}\n{msg}")
+                    trade_history.append({"ticker": ticker, "direction": direction, "entry_price": price, "voters_for": voters_for, "voters_against": voters_against, "outcome_pct": None})
+                    results.append(f"Equity trade executed: {ticker}")
                 except Exception as e:
                     results.append(f"Equity execution failed: {e}")
             else:
-                results.append(f"Equity blocked: {reason}")
-        else:
-            results.append("No executable equity ticker identified in signal")
+                results.append(f"Equity blocked: {block_reason}")
 
     if not results:
-        return "No trades executed this cycle"
-    return "\n".join(results)
+        return "No trades executed this cycle", voters_for, voters_against
+    return "\n".join(results), voters_for, voters_against
 
 def ask_misfit(name, persona, signal, knowledge=""):
+    scorecard_context = build_scorecard_context()
     knowledge_context = f"\n\nDEEP KNOWLEDGE BASE:\n{knowledge}" if knowledge else ""
+    score_context = f"\n\nCURRENT TRACK RECORD:\n{scorecard_context}" if scorecard_context else ""
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=400,
-        messages=[{"role": "user", "content": f"{persona}{knowledge_context}\n\nYoniBot signal:\n{signal}\n\nGive your verdict in 2-3 sentences. Be brutal and direct. End with VOTE: TRADE or VOTE: PASS on its own line."}]
+        messages=[{"role": "user", "content": f"{persona}{knowledge_context}{score_context}\n\nYoniBot signal:\n{signal}\n\nGive your verdict in 2-3 sentences. Be brutal and direct. End with VOTE: TRADE or VOTE: PASS on its own line."}]
     )
     return msg.content[0].text
 
 def ask_jane_street(signal, verdicts):
     debate = "\n\n".join([f"{n}:\n{v}" for n, v in verdicts])
+    scorecard = build_scorecard_context()
+    score_context = f"\n\nMISFIT TRACK RECORD:\n{scorecard}" if scorecard else ""
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=400,
-        messages=[{"role": "user", "content": f"You ARE Jane Street quant engine.\n\nSIGNAL:\n{signal}\n\nDEBATE:\n{debate}\n\nCalculate edge, Kelly size, max drawdown in 2-3 sentences. End with VETO: BLOCKED or VETO: APPROVED on its own line."}]
+        messages=[{"role": "user", "content": f"You ARE Jane Street quant engine.{score_context}\n\nSIGNAL:\n{signal}\n\nDEBATE:\n{debate}\n\nCalculate edge, Kelly size, max drawdown. End with VETO: BLOCKED or VETO: APPROVED on its own line."}]
     )
     return msg.content[0].text
 
@@ -683,12 +906,12 @@ def run_cycle():
             del recent_signals[key]
 
     portfolio_state = get_portfolio_state()
-
     if daily_start_value is None and portfolio_state:
         daily_start_value = portfolio_state["portfolio_value"]
 
     vix = get_vix()
 
+    handle_telegram_commands(portfolio_state, vix)
     check_stop_losses(portfolio_state)
 
     if cycle_count % 4 == 0:
@@ -713,27 +936,25 @@ def run_cycle():
     geo = get_geopolitical_news()
     congress = get_congressional_trading()
 
+    scorecard_context = build_scorecard_context()
     portfolio_summary = ""
     if portfolio_state:
         portfolio_summary = f"""
-CURRENT PORTFOLIO STATE:
+CURRENT PORTFOLIO:
 Value: ${portfolio_state['portfolio_value']:,.2f}
-Equity allocation: {portfolio_state['equity_pct']*100:.1f}% (max {MAX_EQUITY_PCT*100:.0f}%)
-Crypto allocation: {portfolio_state['crypto_pct']*100:.1f}% (max {MAX_CRYPTO_PCT*100:.0f}%)
-Leveraged ETF allocation: {portfolio_state['leveraged_pct']*100:.1f}% (max {MAX_LEVERAGED_PCT*100:.0f}%)
+Equity: {portfolio_state['equity_pct']*100:.1f}% | Crypto: {portfolio_state['crypto_pct']*100:.1f}% | Leveraged: {portfolio_state['leveraged_pct']*100:.1f}%
 Open positions: {', '.join(portfolio_state['positions'].keys()) if portfolio_state['positions'] else 'None'}
 VIX: {vix:.1f}"""
 
     market_status = "OPEN" if market_open else "CLOSED -- crypto only"
-
-    yoni_push = ""
-    if high_conviction_rotation:
-        yoni_push = f"\nYONIBOT HIGH CONVICTION: Omniscient Rotation selected {rotation_ticker} score {rotation_score:.3f}. Push hard for this trade."
+    yoni_push = f"\nYONIBOT HIGH CONVICTION: Rotation selected {rotation_ticker} score {rotation_score:.3f}. Push hard." if high_conviction_rotation else ""
 
     context = f"""MARKET STATUS: {market_status}
 {portfolio_summary}
 
-OMNISCIENT ROTATION (2,324% backtest 2019-2026):
+{scorecard_context}
+
+OMNISCIENT ROTATION (2324% backtest 2019-2026):
 {rotation_summary if rotation_summary else 'Unavailable'}
 
 TECHNICAL INDICATORS:
@@ -758,26 +979,23 @@ CONGRESSIONAL TRADING:
 {congress}
 {yoni_push}"""
 
-    weekend_note = "" if market_open else "\nMARKET CLOSED. Crypto signals only. Bitcoin, Ethereum, Solana trade 24/7."
+    weekend_note = "" if market_open else "\nMARKET CLOSED. Crypto signals only."
 
     yoni = client.messages.create(
         model="claude-opus-4-5-20251101",
         max_tokens=1024,
-        messages=[{"role": "user", "content": f"""You are YoniBot, autonomous trading intelligence for Satis House Consulting. No personal investment references. Pure quantitative signal generation only.
+        messages=[{"role": "user", "content": f"""You are YoniBot, autonomous trading intelligence for Satis House Consulting. Pure quantitative signal generation only. No personal investment references.
 
 {context}
 {weekend_note}
 
 Rules:
-- Omniscient Rotation signal is highest conviction tool.
-- RSI below 30 oversold. RSI above 70 overbought.
-- MACD crossing above signal line bullish. Below bearish.
-- Narrow Bollinger Band width means imminent breakout.
-- Only generate signal if two indicators confirm AND news supports.
-- Consider current portfolio allocations and avoid breaching limits.
-- Market closed means crypto signals only.
+- Omniscient Rotation is highest conviction tool.
+- Only signal if two indicators confirm AND news supports.
+- Consider current portfolio allocations.
+- Market closed means crypto only.
 - Say NO SIGNAL if nothing qualifies.
-- Output: Asset, Direction, Entry Zone, Stop, Target, Confirming Indicators. Max 300 words."""}]
+- Output: Asset, Direction, Entry Zone, Stop, Target, Why. Max 300 words."""}]
     )
     signal = yoni.content[0].text
 
@@ -796,12 +1014,18 @@ Rules:
     majority = vote_count >= 3
 
     if majority and approved:
-        trade_result = execute_trade(signal, vote_count, portfolio_state, vix, rotation_ticker if high_conviction_rotation else None, high_conviction_rotation)
+        trade_result, voters_for, voters_against = execute_trade(
+            signal, vote_count, verdicts, portfolio_state, vix,
+            rotation_ticker if high_conviction_rotation else None,
+            high_conviction_rotation
+        )
         verdict_line = f"VERDICT: EXECUTE -- {vote_count}/5 voted TRADE. Jane Street approved.\n{trade_result}"
     elif not approved:
         verdict_line = f"VERDICT: BLOCKED -- Jane Street vetoed. ({vote_count}/5 voted TRADE)"
+        send_performance(format_no_signal_message())
     else:
-        verdict_line = f"VERDICT: PASS -- Only {vote_count}/5 voted TRADE. No majority."
+        verdict_line = f"VERDICT: PASS -- Only {vote_count}/5 voted TRADE."
+        send_performance(format_no_signal_message())
 
     msg1 = f"YONIBOT SIGNAL\n{signal}"
     msg2 = "THE MISFITS DEBATE\n"
