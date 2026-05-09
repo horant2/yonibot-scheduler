@@ -1,62 +1,108 @@
-# YoniBot and The Misfits -- System Handoff
+# Satis House Consulting -- YoniBot and The Misfits
 Last updated: May 9 2026
 
-## Two Systems Running
+## System Status
+Both systems running 24/7 on Railway. Paper trading active. Live capital pending Alpaca identity verification.
+
+## Two Systems
 
 ### System 1 -- YoniBot and The Misfits
 - Railway: github.com/horant2/yonibot-scheduler
-- Alpaca: original paper account, $100K
+- Alpaca: original paper account, $100K inception value
 - Telegram signals: TitoWHACK_bot
-- Telegram performance: MisfitsPerformance_bot, chat ID -5111730059
-- Nine Claude Console agents: YoniBot, SorosBot, Druckenmiller, PTJ, Tepper, Andurand, Jane Street, OmniscientBot
+- Telegram performance: MisfitsPerformance_bot, chat ID -1003901073130
+- Strategy: Multi-agent AI debate, Omniscient Rotation, news intelligence, arXiv research
 
 ### System 2 -- OmniscientBot Pure Rotation
 - Railway: github.com/horant2/omniscient-scheduler
-- Alpaca: second paper account
+- Alpaca: second paper account, separate credentials
 - Telegram: same channels as System 1
-- Strategy: TheOmniscientParadox, 2324% backtest 2019-2026
+- Strategy: TheOmniscientParadox by Naitik Gupta, 2324% backtest 2019-2026
 
-## Execution Architecture (System 1)
-Seven rules enforced before every trade:
-1. Position awareness -- no duplicate positions in same asset same direction
-2. Market hours routing -- equities and leveraged ETFs only 9:30-4:00 ET weekdays
-3. Allocation limits -- equity 40%, crypto 20%, leveraged ETF 30%, single position 15%
-4. Direction conflict -- close existing position before reversing
-5. Daily loss limit -- 3% drawdown halts all trading for the day
-6. VIX circuit breaker -- reduce size 50% above 35, stop equity trading above 50
-7. Duplicate signal prevention -- same signal blocked for 2 cycles after execution
+## Nine Claude Console Agents (platform.claude.ai)
+- YoniBot -- signal intelligence, arXiv papers, anomaly detection
+- SorosBot -- reflexivity, peg hunting, Black Wednesday template
+- Druckenmiller -- asymmetric concentration, stop first
+- PTJ -- 5 to 1 minimum, Black Monday framework
+- Tepper -- Federal Reserve policy radar, 2009 bank trade template
+- Andurand -- physical commodity flows, Hormuz protocol
+- Jane Street -- pure math, Kelly sizing, veto power
+- OmniscientBot -- pure systematic rotation, no opinion
 
-## Execution Architecture (System 2)
-- Market hours only for all rotations
-- Cancel stale orders at 9:30 AM daily
-- Read actual Alpaca positions before deciding to rotate
-- Single asset at a time, BIL as safe haven
+## Architecture -- The Druckenmiller Model
+High conviction, concentrated bets. Few trades. Large sizes when right. Fast exits when wrong. Stay in cash most of the time.
+
+NOT Renaissance (thousands of tiny bets). NOT conservative institutional (monthly limits, cash reserves). Druckenmiller: when the signal is right, go big. When wrong, exit fast.
+
+## Five Non-Negotiable Rules (and nothing else)
+1. Max 2 orders per cycle -- Knight Capital prevention
+2. Order fill verification -- confirm fill before placing stop loss
+3. Daily 3% loss limit -- one circuit breaker only
+4. Friday short close rule -- all shorts closed by 3:30 PM ET Fridays, no new shorts after 2 PM ET Fridays
+5. Stop loss atomic with entry -- if stop fails, position closes immediately
+
+## Conviction Sizing
+- 3 of 5 Misfits vote TRADE plus Jane Street approves: 5% of portfolio
+- 4 of 5: 8% of portfolio
+- 5 of 5: 10% of portfolio
+- Omniscient Rotation high conviction: 15% of portfolio
+- VIX above 35: all sizes cut 50%
+- VIX above 50: no new equity trades
+
+## Allocation Guardrails (caps not gates)
+- Equity max 60%
+- Crypto max 25%
+- Leveraged ETF max 45%
+
+## Signal Architecture
+- Omniscient Rotation (2324% backtest) is highest conviction tool
+- YoniBot scans: RSI, MACD, Bollinger Bands, yield curve, Fear and Greed, arXiv papers, market news, geopolitical news, congressional trading
+- Five Misfits debate every signal with deep Exa knowledge refresh every 8 cycles
+- Jane Street has veto power
+- Training loop: Misfit scorecard tracks win rates, injected into every debate
+
+## Performance Channel Format
+One-way broadcast only. Human-readable for friends and family. Every message signed Satis House Consulting. Net profit since inception on every portfolio update.
+
+Fires on: trade executed, stop loss triggered, Friday short close, hourly position report, daily circuit breaker, startup.
 
 ## Railway Variables (yonibot-scheduler)
-ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-TELEGRAM_PERFORMANCE_TOKEN, TELEGRAM_PERFORMANCE_CHAT_ID,
-FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY, EXA_API_KEY,
-ALPACA_API_KEY, ALPACA_SECRET_KEY
+ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_PERFORMANCE_TOKEN, TELEGRAM_PERFORMANCE_CHAT_ID (-1003901073130), FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY, EXA_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY
 
 ## Railway Variables (omniscient-scheduler)
-TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-ALPACA_API_KEY (new account), ALPACA_SECRET_KEY (new account)
-
-## Three Gaps Still Open
-1. Training loop -- feed closed trade outcomes back to weight Misfits by win rate. Free to build. Needs 10 closed trades first.
-2. Unusual Whales API -- options flow and dark pool data. $125/mo. Wait until paper trading proves edge.
-3. Memory Store connection -- Misfits Memory Store exists on Claude Console but agent attachment not yet supported in UI.
-
-## Next Build List
-1. Telegram command interface -- send commands to YoniBot from Telegram
-2. Training loop -- outcome feedback into Misfits context
-3. QuantConnect validation of Misfits signal history
-4. Unusual Whales wire-in when account goes live
-5. Options execution -- live when Alpaca identity verification approves
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_PERFORMANCE_TOKEN, TELEGRAM_PERFORMANCE_CHAT_ID (-1003901073130), ALPACA_API_KEY (second account), ALPACA_SECRET_KEY (second account)
 
 ## Monday Morning Checklist
-- Check Alpaca identity verification status
-- Review paper trading results from weekend
-- Compare OmniscientBot vs Misfits performance
+- Check Alpaca identity verification -- options live the moment it approves
+- Review paper trading results from the weekend
+- Compare OmniscientBot vs Misfits performance in Alpaca
 - Check Railway usage and costs
 - Review any EXECUTE verdicts and outcomes
+
+## Next Build List
+- Weighted Bayesian voting -- Misfits with higher win rates get heavier votes. Needs 30 closed trades first.
+- OmniscientBot performance messages upgrade -- net profit since inception format
+- QuantConnect validation of Misfits signal history -- after two weeks of data
+- Unusual Whales options flow -- $125 per month, after paper trading proves edge
+- Live capital deployment -- $25K per account, after two weeks paper trading, scale from there
+
+## Standing Rules
+- Every session ends with HANDOFF.md updated
+- Every session ends with memory updated
+- Never touch live capital without two weeks paper trading data
+- Never add a feature without testing existing system first
+- Replace entire files, never patch
+- Performance channel is one-way broadcast only
+- No personal investment references anywhere in any code or agent
+
+## Known Risks (managed not eliminated)
+- Leveraged ETF gap risk -- TQQQ and SOXL can gap 20 to 30% in a single day. 5% stop loss does not fully protect against gap through. Accepted risk, managed by VIX circuit breaker.
+- Scorecard resets on Railway restart -- training loop data is in-memory only. Persists within a session but resets on redeploy. Future build: persist to external store.
+- yfinance rate limiting -- possible stale data on heavy download cycles. Accepted risk, monitored in logs.
+- Paper vs live slippage -- paper trading assumes perfect fills. Live trading will have slippage especially in leveraged ETFs. Account for this before scaling position sizes.
+
+## Live Capital Plan
+Start: $25K per account (not $100K)
+Scale to $50K after 30 days of profitable live trading
+Scale to $100K after 60 days
+Never risk more than 15% of any account in a single position
