@@ -1,108 +1,119 @@
 # Satis House Consulting -- YoniBot and The Misfits
-Last updated: May 9 2026
+Last updated: May 11 2026
 
 ## System Status
-Both systems running 24/7 on Railway. Paper trading active. Live capital pending Alpaca identity verification.
+Both systems running 24/7 on Railway. Paper trading active.
+Alpaca identity verification pending -- options live when approved.
 
-## Two Systems
+## Two Competing Systems
 
-### System 1 -- YoniBot and The Misfits
+### System 1 -- The Misfits (Contest Model)
 - Railway: github.com/horant2/yonibot-scheduler
-- Alpaca: original paper account, $100K inception value
+- Alpaca: Paper account PA33VZNE4Y6U, $100K inception
 - Telegram signals: TitoWHACK_bot
 - Telegram performance: MisfitsPerformance_bot, chat ID -1003901073130
-- Strategy: Multi-agent AI debate, Omniscient Rotation, news intelligence, arXiv research
+- Architecture: Contest model -- five independent agents compete every cycle
 
-### System 2 -- OmniscientBot Pure Rotation
+### System 2 -- OmniscientBot
 - Railway: github.com/horant2/omniscient-scheduler
-- Alpaca: second paper account, separate credentials
-- Telegram: same channels as System 1
-- Strategy: TheOmniscientParadox by Naitik Gupta, 2324% backtest 2019-2026
+- Alpaca: Paper account PA3WWLUJFQEZ, $100K inception
+- Telegram: same channels
+- Architecture: TheOmniscientParadox pure momentum rotation (2324% backtest 2019-2026)
 
-## Nine Claude Console Agents (platform.claude.ai)
-- YoniBot -- signal intelligence, arXiv papers, anomaly detection
-- SorosBot -- reflexivity, peg hunting, Black Wednesday template
-- Druckenmiller -- asymmetric concentration, stop first
-- PTJ -- 5 to 1 minimum, Black Monday framework
-- Tepper -- Federal Reserve policy radar, 2009 bank trade template
-- Andurand -- physical commodity flows, Hormuz protocol
-- Jane Street -- pure math, Kelly sizing, veto power
-- OmniscientBot -- pure systematic rotation, no opinion
+## Contest Model Architecture (System 1)
 
-## Architecture -- The Druckenmiller Model
-High conviction, concentrated bets. Few trades. Large sizes when right. Fast exits when wrong. Stay in cash most of the time.
+Based on academic literature: TradingAgents team-based contest, PolySwarm Bayesian aggregation, Hidden Strength of Disagreement (implicit consensus outperforms explicit in volatile markets).
 
-NOT Renaissance (thousands of tiny bets). NOT conservative institutional (monthly limits, cash reserves). Druckenmiller: when the signal is right, go big. When wrong, exit fast.
+Each cycle:
+1. Each Misfit independently generates their best trade signal from their own data
+2. Each signal scored: Risk/Reward x Environment Weight x Bayesian Win Rate x Confidence
+3. Highest scoring signal executes -- no veto, no consensus required
+4. Co-signals on same asset or theme boost position size
+5. Quarter-Kelly sizing with multipliers for confidence and co-signals
 
-## Five Non-Negotiable Rules (and nothing else)
+Minimum bar for execution: contest score above 1.5 AND risk reward above 2.0
+
+## Five Misfits -- Independent Data Universes
+
+Soros: FX pairs, EM ETFs, CFTC currency positioning, sovereign stress, Exa currency crisis intelligence
+Druckenmiller: FRED high yield spreads, Fed balance sheet, CFTC equity futures, momentum across asset classes
+PTJ: VIX term structure, volume ratios, SMA crossovers, 20-day price range position
+Tepper: FRED Treasury yields, credit delinquency, CFTC Treasury positioning, HYG/LQD/TLT momentum
+Andurand: EIA Cushing draws, AISStream Hormuz vessel tracking, CFTC crude positioning, energy ETFs, oil-linked FX
+
+## Environment-Based Weight Elevation
+Energy crisis: Andurand 2.5x
+Currency crisis: Soros 2.5x
+Market crash: PTJ 2.5x, Druckenmiller 1.5x
+Credit crisis: Tepper 2.0x, Druckenmiller 1.5x
+Tech bull: Druckenmiller 1.5x
+Default: 1.0x (Bayesian-updated after 10 closed trades)
+
+## Five Non-Negotiable Risk Rules
 1. Max 2 orders per cycle -- Knight Capital prevention
-2. Order fill verification -- confirm fill before placing stop loss
-3. Daily 3% loss limit -- one circuit breaker only
-4. Friday short close rule -- all shorts closed by 3:30 PM ET Fridays, no new shorts after 2 PM ET Fridays
-5. Stop loss atomic with entry -- if stop fails, position closes immediately
+2. Order fill verification before stop loss placed
+3. Daily 3% loss limit circuit breaker
+4. Friday short close rule -- all shorts closed by 3:30 PM ET, no new shorts after 2 PM ET
+5. Stop loss placed atomically with every entry -- if stop fails position closes immediately
 
-## Conviction Sizing
-- 3 of 5 Misfits vote TRADE plus Jane Street approves: 5% of portfolio
-- 4 of 5: 8% of portfolio
-- 5 of 5: 10% of portfolio
-- Omniscient Rotation high conviction: 15% of portfolio
-- VIX above 35: all sizes cut 50%
-- VIX above 50: no new equity trades
+## Asset Universe (both systems)
+Equities long and short, leveraged ETFs, crypto (24/7), FX proxies, bond ETFs, commodity ETFs, energy sector, shipping, refiners
 
-## Allocation Guardrails (caps not gates)
-- Equity max 60%
-- Crypto max 25%
-- Leveraged ETF max 45%
-
-## Signal Architecture
-- Omniscient Rotation (2324% backtest) is highest conviction tool
-- YoniBot scans: RSI, MACD, Bollinger Bands, yield curve, Fear and Greed, arXiv papers, market news, geopolitical news, congressional trading
-- Five Misfits debate every signal with deep Exa knowledge refresh every 8 cycles
-- Jane Street has veto power
-- Training loop: Misfit scorecard tracks win rates, injected into every debate
-
-## Performance Channel Format
-One-way broadcast only. Human-readable for friends and family. Every message signed Satis House Consulting. Net profit since inception on every portfolio update.
-
-Fires on: trade executed, stop loss triggered, Friday short close, hourly position report, daily circuit breaker, startup.
+## Data APIs Wired
+- EIA API (free): Cushing storage, refinery utilization, crude imports
+- FRED API (free): credit spreads, Fed balance sheet, delinquency rates, Treasury yields
+- CFTC Commitment of Traders (free): hedge fund positioning in FX, crude, equity, Treasury futures
+- AISStream (free): live vessel positions in Hormuz bounding box
+- Exa: live news, academic papers, geopolitical intelligence per Misfit
 
 ## Railway Variables (yonibot-scheduler)
-ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_PERFORMANCE_TOKEN, TELEGRAM_PERFORMANCE_CHAT_ID (-1003901073130), FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY, EXA_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY
+ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+TELEGRAM_PERFORMANCE_TOKEN, TELEGRAM_PERFORMANCE_CHAT_ID (-1003901073130),
+EXA_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY,
+FRED_API_KEY, EIA_API_KEY, AISSTREAM_API_KEY
 
 ## Railway Variables (omniscient-scheduler)
-TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_PERFORMANCE_TOKEN, TELEGRAM_PERFORMANCE_CHAT_ID (-1003901073130), ALPACA_API_KEY (second account), ALPACA_SECRET_KEY (second account)
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+TELEGRAM_PERFORMANCE_TOKEN, TELEGRAM_PERFORMANCE_CHAT_ID (-1003901073130),
+ALPACA_API_KEY (PA3WWLUJFQEZ account), ALPACA_SECRET_KEY
+
+## Persistent Logging
+Log file: /tmp/misfits_log.json
+Survives between cycles. Resets on Railway redeploy.
+Tracks: session stats, trade history, Misfit scorecard, contest wins.
+Daily scorecard fires to performance channel at 9 AM ET.
 
 ## Monday Morning Checklist
-- Check Alpaca identity verification -- options live the moment it approves
-- Review paper trading results from the weekend
-- Compare OmniscientBot vs Misfits performance in Alpaca
+- Check Alpaca identity verification status -- options live when approved
+- Review paper trading results from weekend
+- Compare OmniscientBot vs Misfits P&L
 - Check Railway usage and costs
-- Review any EXECUTE verdicts and outcomes
+- Review contest win distribution across Misfits
 
 ## Next Build List
-- Weighted Bayesian voting -- Misfits with higher win rates get heavier votes. Needs 30 closed trades first.
-- OmniscientBot performance messages upgrade -- net profit since inception format
-- QuantConnect validation of Misfits signal history -- after two weeks of data
-- Unusual Whales options flow -- $125 per month, after paper trading proves edge
-- Live capital deployment -- $25K per account, after two weeks paper trading, scale from there
+1. Deflationary AI thesis research -- simultaneous tech deflation and energy crisis, second and third order effects across all asset classes
+2. Misfit leaderboard -- clean performance channel display of contest wins over time
+3. Unusual Whales API ($125/mo) -- when paper trading proves edge
+4. Live capital deployment -- OmniscientBot $25K first, Misfits $25K after two weeks data
+
+## Live Capital Plan
+OmniscientBot first: $25K when identity verification clears
+Misfits: $25K after two weeks contest model data
+Scale to $50K each after 30 days profitable live trading
+Scale to $100K each after 60 days
+Never more than 15% of any account in a single position
+
+## Known Risks
+- Leveraged ETF gap risk: TQQQ/SOXL can gap 20-30% overnight. VIX circuit breaker mitigates but does not eliminate.
+- Log resets on Railway redeploy: trade history and scorecard lost on every GitHub push. Future build: persist to external database.
+- Paper vs live slippage: paper assumes perfect fills. Live will have slippage especially in leveraged ETFs.
+- OmniscientBot 71.5% max drawdown: the backtest shows this strategy has violent drawdowns in bear markets. Size accordingly.
 
 ## Standing Rules
 - Every session ends with HANDOFF.md updated
 - Every session ends with memory updated
 - Never touch live capital without two weeks paper trading data
-- Never add a feature without testing existing system first
 - Replace entire files, never patch
 - Performance channel is one-way broadcast only
-- No personal investment references anywhere in any code or agent
-
-## Known Risks (managed not eliminated)
-- Leveraged ETF gap risk -- TQQQ and SOXL can gap 20 to 30% in a single day. 5% stop loss does not fully protect against gap through. Accepted risk, managed by VIX circuit breaker.
-- Scorecard resets on Railway restart -- training loop data is in-memory only. Persists within a session but resets on redeploy. Future build: persist to external store.
-- yfinance rate limiting -- possible stale data on heavy download cycles. Accepted risk, monitored in logs.
-- Paper vs live slippage -- paper trading assumes perfect fills. Live trading will have slippage especially in leveraged ETFs. Account for this before scaling position sizes.
-
-## Live Capital Plan
-Start: $25K per account (not $100K)
-Scale to $50K after 30 days of profitable live trading
-Scale to $100K after 60 days
-Never risk more than 15% of any account in a single position
+- No personal investment references anywhere in code or agents
+- OmniscientBot and Misfits are completely separate systems -- no cross-contamination
