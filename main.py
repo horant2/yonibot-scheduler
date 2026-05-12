@@ -44,43 +44,30 @@ MAX_LEVERAGED_PCT = 0.45
 DUPLICATE_SIGNAL_BLOCKS = 2
 QUARTER_KELLY_FRACTION = 0.25
 MIN_SIGNAL_SCORE = 1.5
+STOP_PCT = 0.05
+TARGET_PCT = 0.15
 
 LEVERAGED_ETFS = {"TQQQ", "SOXL", "TECL", "FAS", "ERX", "TMF", "SPXL", "UPRO"}
 
-TRADEABLE_UNIVERSE = {
-    "SOXL": "3x Semiconductors",
-    "TECL": "3x Tech",
-    "TQQQ": "3x Nasdaq",
-    "FAS": "3x Financials",
-    "ERX": "2x Energy",
-    "QQQ": "Nasdaq ETF",
-    "SPY": "S&P 500 ETF",
-    "GLD": "Gold ETF",
-    "SLV": "Silver ETF",
-    "TLT": "20Y Treasury ETF",
-    "HYG": "High Yield Bond ETF",
-    "USO": "Oil ETF",
-    "BNO": "Brent Oil ETF",
-    "UNG": "Natural Gas ETF",
-    "XLE": "Energy Sector ETF",
-    "XOP": "Oil & Gas ETF",
-    "FRO": "Frontline Tankers",
-    "VLO": "Valero Energy",
-    "EEM": "Emerging Markets ETF",
-    "UUP": "US Dollar ETF",
-    "FXE": "Euro ETF",
-    "EWZ": "Brazil ETF",
-    "TUR": "Turkey ETF",
-    "IWM": "Russell 2000 ETF",
-    "XLF": "Financials ETF",
-    "BTC/USD": "Bitcoin",
-    "ETH/USD": "Ethereum",
-    "SOL/USD": "Solana"
+TRADEABLE_UNIVERSE = [
+    "SOXL", "TECL", "TQQQ", "FAS", "ERX",
+    "QQQ", "SPY", "IWM", "XLF",
+    "GLD", "SLV", "TLT", "HYG", "UUP",
+    "USO", "BNO", "UNG", "XLE", "XOP", "FRO", "VLO",
+    "EEM", "EWZ", "TUR", "FXE",
+    "BTC-USD", "ETH-USD", "SOL-USD"
+]
+
+CRYPTO_TICKERS = {"BTC-USD", "ETH-USD", "SOL-USD"}
+CRYPTO_ALPACA_MAP = {
+    "BTC-USD": "BTC/USD",
+    "ETH-USD": "ETH/USD",
+    "SOL-USD": "SOL/USD"
 }
 
 live_price_cache = {}
-price_cache_time = {}
-PRICE_CACHE_SECONDS = 60
+price_cache_timestamps = {}
+PRICE_CACHE_TTL = 60
 
 recent_signals = {}
 daily_start_value = None
@@ -99,7 +86,9 @@ misfit_scorecard = {
 }
 
 session_stats = {
-    "execute": 0, "pass": 0, "total": 0,
+    "execute": 0,
+    "pass": 0,
+    "total": 0,
     "misfit_signals": {
         "Soros": {"fired": 0, "skipped": 0},
         "Druckenmiller": {"fired": 0, "skipped": 0},
@@ -111,46 +100,82 @@ session_stats = {
 
 trade_history = []
 
+
+# ── LIVE PRICE ENGINE ─────────────────────────────────────────────────────────
+# This is the ONLY source of prices in the entire system.
+# Claude NEVER provides a price. Claude only provides ticker and direction.
+# All prices are fetched from yfinance and locked before any Misfit speaks.
+
 def get_live_price(ticker):
-    global live_price_cache, price_cache_time
     now = time.time()
-    if ticker in live_price_cache and (now - price_cache_time.get(ticker, 0)) < PRICE_CACHE_SECONDS:
+    if ticker in live_price_cache and (now - price_cache_timestamps.get(ticker, 0)) < PRICE_CACHE_TTL:
         return live_price_cache[ticker]
     try:
-        yf_ticker = ticker.replace("/", "-")
-        period = "2d"
-        interval = "1m"
-        data = yf.download(yf_ticker, period=period, interval=interval, progress=False)
+        yf_ticker = ticker
+        data = yf.download(yf_ticker, period="2d", interval="1m", progress=False, auto_adjust=True)
         if data.empty:
-            data = yf.download(yf_ticker, period="5d", interval="5m", progress=False)
+            data = yf.download(yf_ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
         if not data.empty:
             price = float(data["Close"].squeeze().dropna().iloc[-1])
             live_price_cache[ticker] = price
-            price_cache_time[ticker] = now
+            price_cache_timestamps[ticker] = now
             return price
     except Exception as e:
-        print(f"Price fetch error for {ticker}: {e}")
+        print(f"Price fetch error {ticker}: {e}")
     return None
 
-def get_all_live_prices():
+
+def fetch_all_live_prices():
     prices = {}
-    print("Fetching live prices for tradeable universe...")
+    print("Fetching live prices for all tradeable assets...")
     for ticker in TRADEABLE_UNIVERSE:
         price = get_live_price(ticker)
         if price:
             prices[ticker] = price
-        time.sleep(0.1)
-    print(f"Got live prices for {len(prices)} assets")
+        time.sleep(0.15)
+    print(f"Live prices confirmed for {len(prices)}/{len(TRADEABLE_UNIVERSE)} assets")
     return prices
 
-def build_price_briefing(prices):
-    lines = ["LIVE MARKET PRICES (use ONLY these prices -- do NOT hallucinate prices):"]
-    for ticker, name in TRADEABLE_UNIVERSE.items():
+
+def build_price_table(prices):
+    lines = [
+        "VERIFIED LIVE PRICES -- fetched this second from market data API",
+        "You MUST pick a ticker from this list. You MUST NOT invent any price.",
+        ""
+    ]
+    for ticker in TRADEABLE_UNIVERSE:
         if ticker in prices:
-            lines.append(f"  {ticker} ({name}): ${prices[ticker]:.2f}")
+            lines.append(f"  {ticker}: ${prices[ticker]:.4f}")
         else:
-            lines.append(f"  {ticker} ({name}): price unavailable")
+            lines.append(f"  {ticker}: UNAVAILABLE -- do not use")
     return "\n".join(lines)
+
+
+def apply_live_price(ticker, direction, prices):
+    price = prices.get(ticker)
+    if price is None:
+        return None
+    entry = price
+    if direction == "buy":
+        stop = round(entry * (1 - STOP_PCT), 4)
+        target = round(entry * (1 + TARGET_PCT), 4)
+    else:
+        stop = round(entry * (1 + STOP_PCT), 4)
+        target = round(entry * (1 - TARGET_PCT), 4)
+    win_size = abs(target - entry)
+    loss_size = abs(entry - stop)
+    risk_reward = win_size / loss_size if loss_size > 0 else 3.0
+    return {
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "win_size": win_size,
+        "loss_size": loss_size,
+        "risk_reward": round(risk_reward, 2)
+    }
+
+
+# ── PERSISTENT LOG ────────────────────────────────────────────────────────────
 
 def load_log():
     global session_stats, trade_history, misfit_scorecard
@@ -166,13 +191,13 @@ def load_log():
                     else:
                         session_stats[key] = saved[key]
             trade_history = data.get("trade_history", [])[-200:]
-            saved_sc = data.get("misfit_scorecard", {})
-            for name in misfit_scorecard:
-                if name in saved_sc:
-                    misfit_scorecard[name].update(saved_sc[name])
-            print(f"Log loaded: {session_stats['total']} total cycles, {session_stats['execute']} executions")
+            for name, sc in data.get("misfit_scorecard", {}).items():
+                if name in misfit_scorecard:
+                    misfit_scorecard[name].update(sc)
+            print(f"Log loaded: {session_stats['total']} cycles, {session_stats['execute']} executions")
     except Exception as e:
         print(f"Log load error: {e}")
+
 
 def save_log():
     try:
@@ -186,48 +211,40 @@ def save_log():
     except Exception as e:
         print(f"Log save error: {e}")
 
-def calculate_bayesian_weight(name):
-    scores = misfit_scorecard.get(name, {})
-    total = scores.get("total", 0)
-    correct = scores.get("correct", 0)
-    if total < 10:
-        return 1.0
-    alpha = correct + 1
-    beta_val = (total - correct) + 1
-    posterior_mean = alpha / (alpha + beta_val)
-    return round(max(0.5, min(2.5, posterior_mean / 0.5)), 2)
+
+# ── ENVIRONMENT DETECTION AND WEIGHTS ────────────────────────────────────────
 
 def detect_environment():
-    env = {
-        "energy_crisis": False,
-        "credit_crisis": False,
-        "currency_crisis": False,
-        "market_crash": False
-    }
-    try:
-        checks = [
-            ("USO", "energy_crisis", 0.12, "abs"),
-            ("HYG", "credit_crisis", -0.05, "neg"),
-            ("SPY", "market_crash", -0.10, "neg"),
-            ("UUP", "currency_crisis", 0.05, "abs")
-        ]
-        for ticker, key, threshold, direction in checks:
-            try:
-                price = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
-                ret = float((price.iloc[-1] - price.iloc[0]) / price.iloc[0])
-                if direction == "abs" and abs(ret) > threshold:
-                    env[key] = True
-                elif direction == "neg" and ret < threshold:
-                    env[key] = True
-            except:
-                pass
-    except:
-        pass
+    env = {"energy_crisis": False, "credit_crisis": False, "currency_crisis": False, "market_crash": False}
+    checks = [
+        ("USO", "energy_crisis", 0.12, "abs"),
+        ("HYG", "credit_crisis", -0.05, "neg"),
+        ("SPY", "market_crash", -0.10, "neg"),
+        ("UUP", "currency_crisis", 0.05, "abs")
+    ]
+    for ticker, key, threshold, direction in checks:
+        try:
+            price = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
+            ret = float((price.iloc[-1] - price.iloc[0]) / price.iloc[0])
+            if direction == "abs" and abs(ret) > threshold:
+                env[key] = True
+            elif direction == "neg" and ret < threshold:
+                env[key] = True
+        except:
+            pass
     return env
+
 
 def update_misfit_weights(environment):
     for name in misfit_scorecard:
-        misfit_scorecard[name]["weight"] = calculate_bayesian_weight(name)
+        sc = misfit_scorecard[name]
+        total = sc.get("total", 0)
+        correct = sc.get("correct", 0)
+        if total >= 10:
+            posterior = (correct + 1) / (total + 2)
+            sc["weight"] = round(max(0.5, min(2.5, posterior / 0.5)), 2)
+        else:
+            sc["weight"] = 1.0
     boosts = {
         "energy_crisis": [("Andurand", 2.0)],
         "credit_crisis": [("Tepper", 2.0), ("Druckenmiller", 1.5)],
@@ -237,10 +254,12 @@ def update_misfit_weights(environment):
     for env_key, names in boosts.items():
         if environment.get(env_key):
             for name, boost in names:
-                current = misfit_scorecard[name]["weight"]
-                misfit_scorecard[name]["weight"] = max(current, boost)
+                misfit_scorecard[name]["weight"] = max(misfit_scorecard[name]["weight"], boost)
 
-def get_fred_data(series_id):
+
+# ── SPECIALIST DATA FEEDS ─────────────────────────────────────────────────────
+
+def get_fred(series_id):
     try:
         r = requests.get(
             "https://api.stlouisfed.org/fred/series/observations",
@@ -256,93 +275,79 @@ def get_fred_data(series_id):
         pass
     return None
 
+
 def get_soros_data():
+    data = {}
     try:
-        data = {}
-        usdx = get_fred_data("DTWEXBGS")
-        if usdx:
-            data["dollar_index"] = usdx
-        for pair, ticker in [("EUR_USD", "EURUSD=X"), ("GBP_USD", "GBPUSD=X"), ("TUR", "TUR"), ("EWZ", "EWZ"), ("EEM", "EEM")]:
+        usdx = get_fred("DTWEXBGS")
+        if usdx: data["dollar_index"] = usdx
+        for pair, ticker in [("EUR_USD", "EURUSD=X"), ("GBP_USD", "GBPUSD=X"), ("TUR", "TUR"), ("EWZ", "EWZ")]:
             try:
-                price = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
-                data[f"{pair}_30d_pct"] = round(float((price.iloc[-1] - price.iloc[0]) / price.iloc[0] * 100), 2)
+                px = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
+                data[f"{pair}_30d_pct"] = round(float((px.iloc[-1] - px.iloc[0]) / px.iloc[0] * 100), 2)
             except:
                 pass
         try:
             cot = requests.get(
-                "https://publicreporting.cftc.gov/resource/jun7-fc8e.json?$limit=3&$order=report_date_as_yyyy_mm_dd DESC&$where=contract_market_name=%27EURO FX%27",
-                timeout=10
+                "https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
+                "?$limit=3&$order=report_date_as_yyyy_mm_dd DESC"
+                "&$where=contract_market_name=%27EURO FX%27", timeout=10
             ).json()
             if cot:
                 net = int(cot[0].get("noncomm_positions_long_all", 0)) - int(cot[0].get("noncomm_positions_short_all", 0))
                 data["euro_fx_hedge_fund_net"] = net
         except:
             pass
-        return data
     except:
-        return {}
+        pass
+    return data
+
 
 def get_druckenmiller_data():
+    data = {}
     try:
-        data = {}
-        hy = get_fred_data("BAMLH0A0HYM2")
-        fed = get_fred_data("WALCL")
-        cc = get_fred_data("DRCCLACBS")
-        if hy: data["high_yield_spread"] = hy
-        if fed: data["fed_balance_sheet_billions"] = round(fed / 1000, 1)
-        if cc: data["credit_card_delinquency"] = cc
+        for series, label in [("BAMLH0A0HYM2", "hy_spread"), ("WALCL", "fed_balance_sheet"), ("DRCCLACBS", "cc_delinquency")]:
+            val = get_fred(series)
+            if val: data[label] = val
         for asset in ["SPY", "QQQ", "HYG", "TLT", "IWM"]:
             try:
-                price = yf.download(asset, period="60d", progress=False)["Close"].squeeze()
-                data[f"{asset}_20d_momentum"] = round(float((price.iloc[-1] - price.iloc[-20]) / price.iloc[-20] * 100), 2)
+                px = yf.download(asset, period="60d", progress=False)["Close"].squeeze()
+                data[f"{asset}_20d_mom"] = round(float((px.iloc[-1] - px.iloc[-20]) / px.iloc[-20] * 100), 2)
             except:
                 pass
-        try:
-            cot = requests.get(
-                "https://publicreporting.cftc.gov/resource/jun7-fc8e.json?$limit=3&$order=report_date_as_yyyy_mm_dd DESC&$where=contract_market_name=%27E-MINI S%26P 500%27",
-                timeout=10
-            ).json()
-            if cot:
-                net = int(cot[0].get("noncomm_positions_long_all", 0)) - int(cot[0].get("noncomm_positions_short_all", 0))
-                data["sp500_hedge_fund_net"] = net
-        except:
-            pass
-        return data
     except:
-        return {}
+        pass
+    return data
+
 
 def get_ptj_data():
+    data = {}
     try:
-        data = {}
         vix = yf.download("^VIX", period="60d", progress=False)["Close"].squeeze()
         data["vix_current"] = round(float(vix.iloc[-1]), 1)
         data["vix_30d_avg"] = round(float(vix.rolling(30).mean().iloc[-1]), 1)
         data["vix_regime"] = "ELEVATED" if float(vix.iloc[-1]) > float(vix.rolling(30).mean().iloc[-1]) else "NORMAL"
-        for ticker in ["SPY", "QQQ", "IWM", "GLD"]:
+        for ticker in ["SPY", "QQQ", "IWM"]:
             try:
                 df = yf.download(ticker, period="200d", progress=False)
                 close = df["Close"].squeeze()
                 vol = df["Volume"].squeeze()
                 sma50 = float(close.rolling(50).mean().iloc[-1])
                 price = float(close.iloc[-1])
-                vol_ratio = float(vol.iloc[-1] / vol.rolling(20).mean().iloc[-1])
                 data[f"{ticker}_vs_sma50_pct"] = round((price - sma50) / sma50 * 100, 2)
-                data[f"{ticker}_volume_ratio"] = round(vol_ratio, 2)
+                data[f"{ticker}_volume_ratio"] = round(float(vol.iloc[-1] / vol.rolling(20).mean().iloc[-1]), 2)
             except:
                 pass
-        return data
     except:
-        return {}
+        pass
+    return data
+
 
 def get_tepper_data():
+    data = {}
     try:
-        data = {}
-        for series, label in [
-            ("BAMLH0A0HYM2", "hy_spread"),
-            ("BAMLC0A0CM", "ig_spread"),
-            ("DRCCLACBS", "cc_delinquency")
-        ]:
-            val = get_fred_data(series)
+        for series, label in [("BAMLH0A0HYM2", "hy_spread"), ("BAMLC0A0CM", "ig_spread"), ("DRCCLACBS", "cc_delinquency")]:
+            val = get_fred(series)
             if val: data[label] = val
         for mat, ticker in [("2Y", "^IRX"), ("10Y", "^TNX"), ("30Y", "^TYX")]:
             try:
@@ -352,24 +357,25 @@ def get_tepper_data():
             except:
                 pass
         try:
-            exa_results = exa.search_and_contents(
-                "Federal Reserve policy credit market 2026", num_results=2,
-                text={"max_characters": 300}
-            )
-            data["fed_intelligence"] = " | ".join([r.title for r in exa_results.results])
+            fed_intel = exa.search_and_contents("Federal Reserve policy credit market 2026", num_results=2, text={"max_characters": 300})
+            data["fed_intelligence"] = " | ".join([r.title for r in fed_intel.results])
         except:
             pass
-        return data
     except:
-        return {}
+        pass
+    return data
+
 
 def get_andurand_data():
+    data = {}
     try:
-        data = {}
         try:
-            eia_url = f"https://api.eia.gov/v2/petroleum/stoc/wstk/data/?frequency=weekly&data[]=value&facets[series][]=W_EPC0_SAX_YCUOK_MBBL&sort[0][column]=period&sort[0][direction]=desc&length=4&api_key={EIA_API_KEY}"
-            r = requests.get(eia_url, timeout=10).json()
-            obs = r.get("response", {}).get("data", [])
+            eia_url = (f"https://api.eia.gov/v2/petroleum/stoc/wstk/data/"
+                       f"?frequency=weekly&data[]=value"
+                       f"&facets[series][]=W_EPC0_SAX_YCUOK_MBBL"
+                       f"&sort[0][column]=period&sort[0][direction]=desc"
+                       f"&length=4&api_key={EIA_API_KEY}")
+            obs = requests.get(eia_url, timeout=10).json().get("response", {}).get("data", [])
             if obs and len(obs) >= 2:
                 data["cushing_stocks_mbbl"] = float(obs[0].get("value", 0))
                 data["cushing_draw_mbbl"] = float(obs[0].get("value", 0)) - float(obs[1].get("value", 0))
@@ -377,16 +383,17 @@ def get_andurand_data():
             pass
         with hormuz_lock:
             data["vessels_near_hormuz"] = len(hormuz_vessels)
-        for ticker, name in [("USO", "wti"), ("BNO", "brent"), ("UNG", "natgas"), ("ERX", "energy_2x"), ("XLE", "energy_sector"), ("FRO", "tankers")]:
+        for ticker, name in [("USO", "wti"), ("BNO", "brent"), ("UNG", "natgas"), ("ERX", "energy_2x"), ("FRO", "tankers")]:
             try:
-                price = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
-                data[f"{name}_30d_pct"] = round(float((price.iloc[-1] - price.iloc[0]) / price.iloc[0] * 100), 2)
+                px = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
+                data[f"{name}_30d_pct"] = round(float((px.iloc[-1] - px.iloc[0]) / px.iloc[0] * 100), 2)
             except:
                 pass
         try:
             cot = requests.get(
-                "https://publicreporting.cftc.gov/resource/jun7-fc8e.json?$limit=3&$order=report_date_as_yyyy_mm_dd DESC&$where=contract_market_name=%27CRUDE OIL%27",
-                timeout=10
+                "https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
+                "?$limit=3&$order=report_date_as_yyyy_mm_dd DESC"
+                "&$where=contract_market_name=%27CRUDE OIL%27", timeout=10
             ).json()
             if cot:
                 net = int(cot[0].get("noncomm_positions_long_all", 0)) - int(cot[0].get("noncomm_positions_short_all", 0))
@@ -394,243 +401,221 @@ def get_andurand_data():
         except:
             pass
         try:
-            exa_results = exa.search_and_contents(
-                "Strait Hormuz tanker oil Iran OPEC energy 2026", num_results=3,
-                text={"max_characters": 400}
-            )
-            data["hormuz_intelligence"] = " | ".join([r.title for r in exa_results.results])
+            hormuz_intel = exa.search_and_contents("Strait Hormuz tanker oil Iran OPEC 2026", num_results=3, text={"max_characters": 400})
+            data["hormuz_intelligence"] = " | ".join([r.title for r in hormuz_intel.results])
         except:
             pass
-        return data
     except:
-        return {}
+        pass
+    return data
 
-def generate_misfit_signal(name, task, briefing_data, knowledge, weight, live_prices):
-    weight_note = f"\nYour environment weight is {weight:.1f}x. This is YOUR setup. Be aggressive." if weight > 1.0 else ""
-    data_str = json.dumps(briefing_data, default=str)[:1500]
+
+# ── MISFIT SIGNAL GENERATION ──────────────────────────────────────────────────
+# Claude outputs ONLY: TICKER and DIRECTION.
+# Claude NEVER outputs a price. Prices come from the live price engine above.
+
+def generate_misfit_signal(name, persona, specialist_data, knowledge, weight, price_table, market_note):
+    weight_note = f"\nYour environment weight is {weight:.1f}x -- this is your moment, be aggressive." if weight > 1.0 else ""
+    data_str = json.dumps(specialist_data, default=str)[:1500]
     knowledge_str = knowledge[:600] if knowledge else ""
-    scorecard = misfit_scorecard.get(name, {})
-    total = scorecard.get("total", 0)
-    correct = scorecard.get("correct", 0)
-    record_str = f"Your track record: {correct}/{total} correct." if total > 0 else "No closed trades yet."
-    price_briefing = build_price_briefing(live_prices)
+    sc = misfit_scorecard.get(name, {})
+    record = f"Your record: {sc.get('correct',0)}/{sc.get('total',0)} correct." if sc.get("total", 0) > 0 else "No closed trades yet."
 
-    msg = client.messages.create(
-        model="claude-opus-4-5-20251101",
-        max_tokens=300,
-        messages=[{"role": "user", "content": f"""{task}{weight_note}
+    prompt = f"""{persona}{weight_note}
 
-{price_briefing}
+{price_table}
 
 YOUR SPECIALIST DATA:
 {data_str}
 
-YOUR KNOWLEDGE:
+YOUR KNOWLEDGE BASE:
 {knowledge_str}
 
-{record_str}
+{record}
 
-CRITICAL RULES:
-1. You MUST use ONLY the live prices listed above. Never invent a price.
-2. Set stop loss at 5% below entry for longs, 5% above for shorts.
-3. Set target at 15% above entry for longs, 15% below for shorts.
-4. You MUST produce a signal. The only valid reason to skip is if markets are closed and no crypto opportunity exists.
+{market_note}
 
-Output EXACTLY this format using ONLY the live prices above:
-TICKER: [exact ticker from the list above]
+YOUR TASK:
+Study your specialist data. Find the single best trade available right now.
+Pick ONE ticker from the verified price list above.
+Pick a direction: BUY or SHORT.
+Give a conviction score 1-10 based on how strongly your data supports this trade.
+Give one sentence of reasoning from YOUR specific framework.
+
+CRITICAL: You output EXACTLY four lines. Nothing else. No prices. No explanation.
+
+TICKER: [ticker exactly as shown in the price list]
 DIRECTION: [BUY or SHORT]
-ENTRY: [exact live price from above -- no other number]
-STOP: [entry minus 5% for BUY, entry plus 5% for SHORT]
-TARGET: [entry plus 15% for BUY, entry minus 15% for SHORT]
-SCORE: [your conviction 1-10]
-REASON: [one sentence using your specific framework and data]
+SCORE: [1-10]
+REASON: [one sentence from your specific framework and data]"""
 
-No preamble. No explanation. Just the six lines above."""}]
+    msg = client.messages.create(
+        model="claude-opus-4-5-20251101",
+        max_tokens=120,
+        messages=[{"role": "user", "content": prompt}]
     )
-    return msg.content[0].text
+    return msg.content[0].text.strip()
 
-def parse_misfit_signal(text, live_prices):
+
+def parse_signal_output(raw_text, prices):
     try:
-        lines = text.strip().split("\n")
         result = {}
-        for line in lines:
+        for line in raw_text.strip().split("\n"):
             if ":" in line:
                 key, val = line.split(":", 1)
                 result[key.strip().upper()] = val.strip()
 
         ticker = result.get("TICKER", "").strip().upper()
-        if not ticker or ticker not in TRADEABLE_UNIVERSE:
-            for t in TRADEABLE_UNIVERSE:
-                if t in text.upper():
-                    ticker = t
-                    break
-            if not ticker:
-                return None
+        direction_raw = result.get("DIRECTION", "").strip().upper()
+        score_raw = result.get("SCORE", "5").strip()
+        reason = result.get("REASON", "Specialist data signal")
 
-        live_price = live_prices.get(ticker)
-        if live_price is None:
-            print(f"No live price for {ticker} -- skipping signal")
+        if not ticker or not direction_raw:
             return None
 
-        direction = "buy" if "BUY" in result.get("DIRECTION", "").upper() else "sell"
+        if ticker not in prices:
+            for t in TRADEABLE_UNIVERSE:
+                if t.upper() == ticker:
+                    ticker = t
+                    break
+            if ticker not in prices:
+                print(f"Ticker {ticker} not in live prices -- signal rejected")
+                return None
 
-        entry = live_price
-
-        if direction == "buy":
-            stop = entry * 0.95
-            target = entry * 1.15
-        else:
-            stop = entry * 1.05
-            target = entry * 0.85
-
-        win_size = abs(target - entry)
-        loss_size = abs(entry - stop)
-        risk_reward = win_size / loss_size if loss_size > 0 else 3.0
+        direction = "buy" if "BUY" in direction_raw else "sell" if "SHORT" in direction_raw else None
+        if direction is None:
+            return None
 
         try:
-            conviction = float(result.get("SCORE", "5"))
+            conviction = float(score_raw)
         except:
             conviction = 5.0
 
-        reason = result.get("REASON", "Signal from specialist data")
+        price_data = apply_live_price(ticker, direction, prices)
+        if price_data is None:
+            return None
 
         return {
             "ticker": ticker,
             "direction": direction,
-            "entry": entry,
-            "stop": stop,
-            "target": target,
-            "risk_reward": round(risk_reward, 2),
-            "win_size": win_size,
-            "loss_size": loss_size,
             "conviction": conviction,
             "reason": reason,
-            "live_price_confirmed": True
+            "entry": price_data["entry"],
+            "stop": price_data["stop"],
+            "target": price_data["target"],
+            "risk_reward": price_data["risk_reward"],
+            "win_size": price_data["win_size"],
+            "loss_size": price_data["loss_size"],
+            "price_source": "live_yfinance"
         }
     except Exception as e:
         print(f"Signal parse error: {e}")
         return None
 
-def score_signal(signal, misfit_name, environment):
+
+def score_signal(signal, name, environment):
     if signal is None:
         return 0.0
     rr = signal.get("risk_reward", 2.0)
     conviction = signal.get("conviction", 5.0) / 10.0
-    weight = misfit_scorecard.get(misfit_name, {}).get("weight", 1.0)
-    sc = misfit_scorecard.get(misfit_name, {})
+    weight = misfit_scorecard.get(name, {}).get("weight", 1.0)
+    sc = misfit_scorecard.get(name, {})
     total = sc.get("total", 0)
     correct = sc.get("correct", 0)
-    bayesian = (correct + 1) / (total + 2) if total > 0 else 0.5
-    composite = rr * conviction * weight * bayesian
-    return round(composite, 3)
+    bayesian = (correct + 1) / (total + 2)
+    return round(rr * conviction * weight * bayesian, 3)
+
 
 def run_contest(signals_scored):
     sorted_signals = sorted(signals_scored.items(), key=lambda x: x[1][1], reverse=True)
-    if not sorted_signals:
-        return []
     winners = []
     used_tickers = set()
-    used_directions = {}
     for name, (signal, score) in sorted_signals:
         if score < MIN_SIGNAL_SCORE:
             continue
-        ticker = signal["ticker"]
-        direction = signal["direction"]
-        if ticker in used_tickers:
+        if signal is None:
             continue
-        ticker_dir = f"{ticker}_{direction}"
-        if ticker_dir in used_directions:
+        ticker = signal["ticker"]
+        if ticker in used_tickers:
             continue
         winners.append((name, signal, score))
         used_tickers.add(ticker)
-        used_directions[ticker_dir] = True
         if len(winners) >= MAX_ORDERS_PER_CYCLE:
             break
     return winners
 
-def kelly_size(signal, misfit_name, portfolio_value):
-    sc = misfit_scorecard.get(misfit_name, {})
+
+def kelly_size(signal, name, portfolio_value):
+    sc = misfit_scorecard.get(name, {})
     total = sc.get("total", 0)
     correct = sc.get("correct", 0)
     win_prob = (correct + 1) / (total + 2)
-    win_size = signal.get("win_size", 1.0)
-    loss_size = signal.get("loss_size", 1.0)
-    b = win_size / loss_size if loss_size > 0 else 3.0
+    b = signal["win_size"] / signal["loss_size"] if signal["loss_size"] > 0 else 3.0
     kelly = max(0, (win_prob * b - (1 - win_prob)) / b)
-    quarter_kelly_size = portfolio_value * kelly * QUARTER_KELLY_FRACTION
-    return min(quarter_kelly_size, portfolio_value * MAX_SINGLE_POSITION)
+    size = portfolio_value * kelly * QUARTER_KELLY_FRACTION
+    return min(size, portfolio_value * MAX_SINGLE_POSITION)
+
+
+# ── TELEGRAM ──────────────────────────────────────────────────────────────────
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-    for chunk in chunks:
+    for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk})
         time.sleep(1)
 
+
 def send_performance(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_PERFORMANCE_TOKEN}/sendMessage"
-    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-    for chunk in chunks:
+    for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
         try:
             r = requests.post(url, json={"chat_id": TELEGRAM_PERFORMANCE_CHAT_ID, "text": chunk}, timeout=10)
-            print(f"Performance send: {r.status_code}")
+            print(f"Performance: {r.status_code}")
         except Exception as e:
-            print(f"Performance send error: {e}")
+            print(f"Performance error: {e}")
         time.sleep(1)
 
+
 def format_trade_alert(name, signal, position_size, score):
-    ticker = signal["ticker"]
-    direction = signal["direction"]
-    entry = signal["entry"]
-    stop = signal["stop"]
-    target = signal["target"]
-    rr = signal["risk_reward"]
-    reason = signal["reason"]
-    action = "Bought" if direction == "buy" else "Sold Short"
-    emoji = "🟢" if direction == "buy" else "🔴"
+    action = "Bought" if signal["direction"] == "buy" else "Sold Short"
+    emoji = "🟢" if signal["direction"] == "buy" else "🔴"
     return f"""{emoji} THE MISFITS JUST TRADED
 
-{name} called it.
-{action} {ticker} at ${entry:.2f} (live price confirmed)
-Bet size: ${position_size:,.0f}
-Stop loss: ${stop:.2f} | Target: ${target:.2f}
-Risk reward: {rr:.1f} to 1 | Contest score: {score:.2f}
+{name} won the contest.
+{action} {signal['ticker']} at ${signal['entry']:.4f}
+Price source: live market data (yfinance)
+Stop loss: ${signal['stop']:.4f} | Target: ${signal['target']:.4f}
+Risk reward: {signal['risk_reward']:.1f} to 1
+Bet size: ${position_size:,.0f} | Contest score: {score:.2f}
 
-Why {name}: {reason}
+Why: {signal['reason']}
 
 -- Satis House Consulting"""
+
 
 def format_position_report(portfolio_state, daily_pnl=None):
-    portfolio_value = portfolio_state["portfolio_value"] if portfolio_state else INCEPTION_VALUE
-    net_profit = portfolio_value - INCEPTION_VALUE
-    net_pct = net_profit / INCEPTION_VALUE * 100
-    profit_emoji = "📈" if net_profit >= 0 else "📉"
-    net_line = f"{profit_emoji} Net profit since inception: {'+' if net_profit >= 0 else ''}${net_profit:,.0f} ({'+' if net_pct >= 0 else ''}{net_pct:.2f}%)"
+    pv = portfolio_state["portfolio_value"] if portfolio_state else INCEPTION_VALUE
+    net = pv - INCEPTION_VALUE
+    net_pct = net / INCEPTION_VALUE * 100
+    net_line = f"{'📈' if net >= 0 else '📉'} Net profit since inception: {'+' if net >= 0 else ''}${net:,.0f} ({'+' if net_pct >= 0 else ''}{net_pct:.2f}%)"
     if not portfolio_state or not portfolio_state["positions"]:
-        return f"""📊 MISFITS PORTFOLIO UPDATE
-
-No open positions right now.
-Total value: ${portfolio_value:,.0f}
-{net_line}
-
--- Satis House Consulting"""
-    lines = ["📊 MISFITS PORTFOLIO UPDATE\n"]
-    lines.append(f"Total value: ${portfolio_value:,.2f}")
+        return f"📊 MISFITS PORTFOLIO UPDATE\n\nNo open positions.\nTotal value: ${pv:,.0f}\n{net_line}\n\n-- Satis House Consulting"
+    lines = ["📊 MISFITS PORTFOLIO UPDATE\n", f"Total value: ${pv:,.2f}"]
     if daily_pnl is not None:
-        lines.append(f"Today: {'📈' if daily_pnl >= 0 else '📉'} {'+' if daily_pnl >= 0 else ''}{daily_pnl*100:.2f}%")
+        lines.append(f"Today: {'📈' if daily_pnl >= 0 else '📉'} {daily_pnl*100:+.2f}%")
     lines.append("\nOpen positions:")
     for symbol, pos in portfolio_state["positions"].items():
-        pnl_emoji = "✅" if pos["unrealized_pnl"] >= 0 else "⚠️"
-        direction = "Long" if pos["side"] == "long" else "Short"
-        lines.append(f"{pnl_emoji} {symbol} ({direction}) -- {'+' if pos['unrealized_pnl'] >= 0 else ''}{pos['unrealized_pct']:.1f}% since entry")
-    lines.append(f"\n{net_line}")
-    lines.append("\n-- Satis House Consulting")
+        emoji = "✅" if pos["unrealized_pnl"] >= 0 else "⚠️"
+        side = "Long" if pos["side"] == "long" else "Short"
+        lines.append(f"{emoji} {symbol} ({side}) -- {pos['unrealized_pct']:+.1f}% since entry")
+    lines.append(f"\n{net_line}\n\n-- Satis House Consulting")
     return "\n".join(lines)
+
 
 def format_daily_scorecard(portfolio_state=None):
     total = session_stats["total"]
     if total == 0:
-        return "📊 MISFITS SCORECARD\n\nNo cycles recorded yet.\n\n-- Satis House Consulting"
+        return "📊 MISFITS SCORECARD\n\nNo cycles yet.\n\n-- Satis House Consulting"
     execute = session_stats["execute"]
     passed = session_stats["pass"]
     net_line = ""
@@ -638,22 +623,27 @@ def format_daily_scorecard(portfolio_state=None):
         pv = portfolio_state["portfolio_value"]
         net = pv - INCEPTION_VALUE
         net_pct = net / INCEPTION_VALUE * 100
-        net_line = f"\n{'📈' if net >= 0 else '📉'} Net profit since inception: {'+' if net >= 0 else ''}${net:,.0f} ({'+' if net_pct >= 0 else ''}{net_pct:.2f}%)"
-    lines = ["📊 MISFITS DAILY SCORECARD\n"]
-    lines.append(f"Total cycles: {total}")
-    lines.append(f"✅ Trades executed: {execute} ({execute/total*100:.0f}%)")
-    lines.append(f"⏭ No qualifying signal: {passed} ({passed/total*100:.0f}%)")
-    lines.append(f"\nMisfit contest performance:")
+        net_line = f"\n{'📈' if net >= 0 else '📉'} Net profit since inception: {'+' if net >= 0 else ''}${net:,.0f} ({net_pct:+.2f}%)"
+    lines = [
+        "📊 MISFITS DAILY SCORECARD\n",
+        f"Total cycles: {total}",
+        f"✅ Trades executed: {execute} ({execute/total*100:.0f}%)",
+        f"⏭ No qualifying signal: {passed} ({passed/total*100:.0f}%)",
+        "\nMisfit contest performance:"
+    ]
     for name, votes in session_stats["misfit_signals"].items():
         total_v = votes["fired"] + votes["skipped"]
         rate = votes["fired"] / total_v * 100 if total_v > 0 else 0
-        weight = misfit_scorecard.get(name, {}).get("weight", 1.0)
         sc = misfit_scorecard.get(name, {})
-        record = f"{sc.get('correct',0)}/{sc.get('total',0)}" if sc.get("total", 0) > 0 else "no trades yet"
-        lines.append(f"  {name}: {votes['fired']}/{total_v} signals fired ({rate:.0f}%) | record: {record} | weight: {weight:.1f}x")
+        record = f"{sc.get('correct',0)}/{sc.get('total',0)}" if sc.get("total", 0) > 0 else "no trades"
+        weight = sc.get("weight", 1.0)
+        lines.append(f"  {name}: {votes['fired']}/{total_v} signals ({rate:.0f}%) | {record} | {weight:.1f}x")
     lines.append(net_line)
     lines.append("\n-- Satis House Consulting")
     return "\n".join(lines)
+
+
+# ── ALPACA ────────────────────────────────────────────────────────────────────
 
 def alpaca_request(method, endpoint, data=None, params=None):
     headers = {
@@ -669,32 +659,51 @@ def alpaca_request(method, endpoint, data=None, params=None):
     elif method == "DELETE":
         return requests.delete(url, headers=headers).json()
 
+
 def get_account():
     return alpaca_request("GET", "/v2/account")
+
 
 def get_positions():
     return alpaca_request("GET", "/v2/positions")
 
+
 def cancel_all_orders():
     return alpaca_request("DELETE", "/v2/orders")
+
 
 def close_position(symbol):
     return alpaca_request("DELETE", f"/v2/positions/{symbol}")
 
-def submit_order(symbol, qty, side, notional=None):
+
+def submit_market_order(symbol, qty, side, notional=None):
     order = {"symbol": symbol, "side": side, "type": "market", "time_in_force": "day"}
     if notional:
         order["notional"] = str(round(notional, 2))
     else:
-        order["qty"] = qty
+        order["qty"] = str(qty)
     return alpaca_request("POST", "/v2/orders", order)
 
-def verify_order_filled(order_id):
+
+def submit_stop_loss(symbol, qty, side, stop_price):
+    result = alpaca_request("POST", "/v2/orders", {
+        "symbol": symbol, "qty": str(qty), "side": side,
+        "type": "stop", "stop_price": str(round(stop_price, 4)),
+        "time_in_force": "gtc"
+    })
+    if not result.get("id"):
+        close_position(symbol)
+        send_performance(f"⚠️ SAFETY CLOSE\n\nStop loss failed on {symbol}. Position closed to protect capital.\n\n-- Satis House Consulting")
+        return False
+    return True
+
+
+def verify_fill(order_id):
     for _ in range(6):
         time.sleep(5)
         try:
             order = alpaca_request("GET", f"/v2/orders/{order_id}")
-            status = order.get("status", "unknown")
+            status = order.get("status", "")
             if status in ["filled", "partially_filled"]:
                 return True
             if status in ["canceled", "rejected", "expired"]:
@@ -703,188 +712,120 @@ def verify_order_filled(order_id):
             pass
     return False
 
-def submit_stop_loss_atomic(symbol, qty, side, stop_price):
+
+def get_portfolio_state():
     try:
-        result = alpaca_request("POST", "/v2/orders", {
-            "symbol": symbol, "qty": qty, "side": side,
-            "type": "stop", "stop_price": str(round(stop_price, 2)),
-            "time_in_force": "gtc"
-        })
-        if not result.get("id"):
-            close_position(symbol)
-            send_performance(f"⚠️ SAFETY CLOSE\n\nStop loss failed on {symbol}. Position closed.\n\n-- Satis House Consulting")
-            return False
-        return True
-    except:
-        close_position(symbol)
-        return False
+        account = get_account()
+        positions = get_positions()
+        pv = float(account.get("portfolio_value", 100000))
+        bp = float(account.get("buying_power", 50000))
+        pos_map = {}
+        equity_v = crypto_v = leveraged_v = 0.0
+        if isinstance(positions, list):
+            for pos in positions:
+                symbol = pos["symbol"]
+                mv = float(pos.get("market_value", 0))
+                side = pos.get("side", "long")
+                qty = float(pos.get("qty", 0))
+                avg = float(pos.get("avg_entry_price", 0))
+                cur = float(pos.get("current_price", 0))
+                pnl = float(pos.get("unrealized_pl", 0))
+                pnl_pct = float(pos.get("unrealized_plpc", 0)) * 100
+                pos_map[symbol] = {"side": side, "qty": qty, "market_value": mv, "avg_entry": avg, "current_price": cur, "unrealized_pnl": pnl, "unrealized_pct": pnl_pct}
+                if "USD" in symbol: crypto_v += abs(mv)
+                elif symbol in LEVERAGED_ETFS: leveraged_v += abs(mv)
+                else: equity_v += abs(mv)
+        return {"portfolio_value": pv, "buying_power": bp, "positions": pos_map,
+                "equity_pct": equity_v / pv if pv > 0 else 0,
+                "crypto_pct": crypto_v / pv if pv > 0 else 0,
+                "leveraged_pct": leveraged_v / pv if pv > 0 else 0}
+    except Exception as e:
+        print(f"Portfolio state error: {e}")
+        return None
+
+
+# ── EXECUTION RULES ───────────────────────────────────────────────────────────
 
 def is_market_hours():
     et = pytz.timezone("America/New_York")
     now = datetime.now(et)
-    if now.weekday() >= 5:
-        return False
-    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    if now.weekday() >= 5: return False
+    return now.replace(hour=9, minute=30, second=0, microsecond=0) <= now <= now.replace(hour=16, minute=0, second=0, microsecond=0)
+
 
 def is_friday_short_blocked():
     et = pytz.timezone("America/New_York")
     now = datetime.now(et)
     return now.weekday() == 4 and now.hour >= FRIDAY_SHORT_CUTOFF_HOUR
 
+
 def should_close_friday_shorts():
     et = pytz.timezone("America/New_York")
     now = datetime.now(et)
-    return now.weekday() == 4 and (now.hour > FRIDAY_SHORT_CLOSE_HOUR or
-           (now.hour == FRIDAY_SHORT_CLOSE_HOUR and now.minute >= FRIDAY_SHORT_CLOSE_MINUTE))
+    return now.weekday() == 4 and (now.hour > FRIDAY_SHORT_CLOSE_HOUR or (now.hour == FRIDAY_SHORT_CLOSE_HOUR and now.minute >= FRIDAY_SHORT_CLOSE_MINUTE))
 
-def close_friday_shorts(portfolio_state):
-    if not portfolio_state or not portfolio_state["positions"]:
-        return
-    for symbol, pos in portfolio_state["positions"].items():
-        if pos["side"] == "short":
-            try:
-                close_position(symbol)
-                result = f"+${abs(pos['unrealized_pnl']):,.0f}" if pos["unrealized_pnl"] >= 0 else f"-${abs(pos['unrealized_pnl']):,.0f}"
-                send_performance(f"""📅 FRIDAY RISK MANAGEMENT
-
-Closed short in {symbol} before weekend.
-Result: {result} ({pos['unrealized_pct']:+.1f}%)
-Capital protected.
-
--- Satis House Consulting""")
-            except Exception as e:
-                print(f"Friday close error {symbol}: {e}")
 
 def get_vix():
     try:
-        vix = yf.download("^VIX", period="1d", interval="1m", progress=False)
-        return float(vix["Close"].squeeze().iloc[-1])
+        v = yf.download("^VIX", period="1d", interval="1m", progress=False)
+        return float(v["Close"].squeeze().dropna().iloc[-1])
     except:
         return 20.0
 
-def get_portfolio_state():
-    try:
-        account = get_account()
-        positions = get_positions()
-        portfolio_value = float(account.get("portfolio_value", 100000))
-        buying_power = float(account.get("buying_power", 50000))
-        position_map = {}
-        equity_value = 0
-        crypto_value = 0
-        leveraged_value = 0
-        if isinstance(positions, list):
-            for pos in positions:
-                symbol = pos["symbol"]
-                market_val = float(pos.get("market_value", 0))
-                side = pos.get("side", "long")
-                qty = float(pos.get("qty", 0))
-                avg_entry = float(pos.get("avg_entry_price", 0))
-                current_price = float(pos.get("current_price", 0))
-                unrealized_pnl = float(pos.get("unrealized_pl", 0))
-                unrealized_pct = float(pos.get("unrealized_plpc", 0)) * 100
-                position_map[symbol] = {
-                    "side": side, "qty": qty, "market_value": market_val,
-                    "avg_entry": avg_entry, "current_price": current_price,
-                    "unrealized_pnl": unrealized_pnl, "unrealized_pct": unrealized_pct,
-                    "pct_of_portfolio": abs(market_val) / portfolio_value if portfolio_value > 0 else 0
-                }
-                if "USD" in symbol:
-                    crypto_value += abs(market_val)
-                elif symbol in LEVERAGED_ETFS:
-                    leveraged_value += abs(market_val)
-                else:
-                    equity_value += abs(market_val)
-        return {
-            "portfolio_value": portfolio_value, "buying_power": buying_power,
-            "positions": position_map,
-            "equity_pct": equity_value / portfolio_value if portfolio_value > 0 else 0,
-            "crypto_pct": crypto_value / portfolio_value if portfolio_value > 0 else 0,
-            "leveraged_pct": leveraged_value / portfolio_value if portfolio_value > 0 else 0
-        }
-    except Exception as e:
-        print(f"Portfolio state error: {e}")
-        return None
 
 def check_execution_rules(ticker, direction, portfolio_state, vix):
     global trades_halted_today, daily_start_value, orders_this_cycle
-    if orders_this_cycle >= MAX_ORDERS_PER_CYCLE:
-        return False, "Max orders per cycle"
-    if trades_halted_today:
-        return False, "Daily loss limit"
-    if portfolio_state is None:
-        return False, "Portfolio unavailable"
-    portfolio_value = portfolio_state["portfolio_value"]
+    if orders_this_cycle >= MAX_ORDERS_PER_CYCLE: return False, "Max orders per cycle"
+    if trades_halted_today: return False, "Daily loss limit"
+    if portfolio_state is None: return False, "Portfolio unavailable"
+    pv = portfolio_state["portfolio_value"]
     if daily_start_value is not None:
-        daily_pnl = (portfolio_value - daily_start_value) / daily_start_value
-        if daily_pnl <= -DAILY_LOSS_LIMIT:
+        if (pv - daily_start_value) / daily_start_value <= -DAILY_LOSS_LIMIT:
             trades_halted_today = True
-            send_performance(f"⚡ CIRCUIT BREAKER\n\nPortfolio down {abs(daily_pnl)*100:.1f}% today.\nAll trading paused until tomorrow.\n\n-- Satis House Consulting")
+            send_performance(f"⚡ CIRCUIT BREAKER\n\nPortfolio down {abs((pv-daily_start_value)/daily_start_value)*100:.1f}% today.\nTrading paused until tomorrow.\n\n-- Satis House Consulting")
             return False, "Daily loss limit triggered"
-    if vix >= VIX_STOP_THRESHOLD:
-        return False, f"VIX {vix:.0f} too high"
-    if direction == "sell" and is_friday_short_blocked():
-        return False, "Friday short rule"
-    signal_key = f"{ticker}_{direction}"
-    if signal_key in recent_signals and recent_signals[signal_key] < DUPLICATE_SIGNAL_BLOCKS:
-        return False, "Duplicate signal"
+    if vix >= VIX_STOP_THRESHOLD: return False, f"VIX {vix:.0f} too high"
+    if direction == "sell" and is_friday_short_blocked(): return False, "Friday short rule"
+    if f"{ticker}_{direction}" in recent_signals and recent_signals[f"{ticker}_{direction}"] < DUPLICATE_SIGNAL_BLOCKS: return False, "Duplicate signal"
     positions = portfolio_state["positions"]
     if ticker in positions:
-        if positions[ticker]["side"] == "long" and direction == "buy":
-            return False, f"Already long {ticker}"
-        if positions[ticker]["side"] == "short" and direction == "sell":
-            return False, f"Already short {ticker}"
-    is_crypto = any(c in ticker.upper() for c in ["BTC", "ETH", "SOL"])
+        if positions[ticker]["side"] == "long" and direction == "buy": return False, f"Already long {ticker}"
+        if positions[ticker]["side"] == "short" and direction == "sell": return False, f"Already short {ticker}"
+    is_crypto = ticker in CRYPTO_TICKERS
     is_leveraged = ticker in LEVERAGED_ETFS
-    if is_leveraged and not is_market_hours():
-        return False, "Leveraged ETF market hours only"
-    if not is_crypto and not is_market_hours():
-        return False, "Market closed"
-    if is_leveraged and portfolio_state["leveraged_pct"] >= MAX_LEVERAGED_PCT:
-        return False, "Leveraged cap"
-    elif is_crypto and portfolio_state["crypto_pct"] >= MAX_CRYPTO_PCT:
-        return False, "Crypto cap"
-    elif not is_crypto and not is_leveraged and portfolio_state["equity_pct"] >= MAX_EQUITY_PCT:
-        return False, "Equity cap"
+    if is_leveraged and not is_market_hours(): return False, "Leveraged ETF market hours only"
+    if not is_crypto and not is_market_hours(): return False, "Market closed"
+    if is_leveraged and portfolio_state["leveraged_pct"] >= MAX_LEVERAGED_PCT: return False, "Leveraged cap"
+    elif is_crypto and portfolio_state["crypto_pct"] >= MAX_CRYPTO_PCT: return False, "Crypto cap"
+    elif not is_crypto and not is_leveraged and portfolio_state["equity_pct"] >= MAX_EQUITY_PCT: return False, "Equity cap"
     return True, "Clear"
+
 
 def execute_winner(name, signal, position_size, portfolio_state, vix):
     global recent_signals, trade_history, orders_this_cycle
     ticker = signal["ticker"]
     direction = signal["direction"]
-    live_price = signal["entry"]
+    entry_price = signal["entry"]
     stop_price = signal["stop"]
-
-    is_crypto = any(c in ticker.upper() for c in ["BTC", "ETH", "SOL"])
-    market_open = is_market_hours()
-
-    if is_crypto:
-        approved, block_reason = check_execution_rules(ticker, direction, portfolio_state, vix)
-        if approved:
-            try:
-                notional = min(position_size, 5000)
-                result = alpaca_request("POST", "/v2/orders", {
-                    "symbol": ticker, "notional": str(round(notional, 2)),
-                    "side": direction, "type": "market", "time_in_force": "gtc"
-                })
-                orders_this_cycle += 1
-                recent_signals[f"{ticker}_{direction}"] = 0
-                trade_history.append({"ticker": ticker, "direction": direction, "entry_price": live_price, "misfit": name, "executed": True, "timestamp": datetime.now(pytz.utc).isoformat()})
-                save_log()
-                return f"Crypto executed: {ticker} ${notional:,.0f} at ~${live_price:.2f}"
-            except Exception as e:
-                return f"Crypto failed: {e}"
-        return f"Blocked: {block_reason}"
-
-    if not market_open:
-        return "Market closed -- equity signal skipped"
+    is_crypto = ticker in CRYPTO_TICKERS
 
     approved, block_reason = check_execution_rules(ticker, direction, portfolio_state, vix)
     if not approved:
         return f"Blocked: {block_reason}"
 
     try:
+        if is_crypto:
+            alpaca_symbol = CRYPTO_ALPACA_MAP.get(ticker, ticker)
+            notional = min(position_size, 5000)
+            result = submit_market_order(alpaca_symbol, None, direction, notional=notional)
+            if result.get("id"):
+                orders_this_cycle += 1
+                recent_signals[f"{ticker}_{direction}"] = 0
+                trade_history.append({"ticker": ticker, "direction": direction, "entry_price": entry_price, "misfit": name, "executed": True, "timestamp": datetime.now(pytz.utc).isoformat()})
+                save_log()
+                return f"Crypto executed: {alpaca_symbol} ${notional:,.0f} at ~${entry_price:.4f}"
+            return f"Crypto order failed: {result.get('message', 'unknown')}"
+
         existing = portfolio_state["positions"].get(ticker, {})
         if existing:
             ex_side = existing.get("side")
@@ -892,74 +833,64 @@ def execute_winner(name, signal, position_size, portfolio_state, vix):
                 close_position(ticker)
                 time.sleep(2)
 
-        qty = max(1, int(position_size / live_price))
-        order = submit_order(ticker, qty, direction)
-        order_id = order.get("id", "unknown")
-        filled = verify_order_filled(order_id)
+        qty = max(1, int(position_size / entry_price))
+        order = submit_market_order(ticker, qty, direction)
+        order_id = order.get("id")
+        if not order_id:
+            return f"Order rejected: {order.get('message', 'unknown')}"
 
+        filled = verify_fill(order_id)
         if not filled:
             return f"{ticker} order did not fill"
 
         orders_this_cycle += 1
         stop_side = "sell" if direction == "buy" else "buy"
-        stop_ok = submit_stop_loss_atomic(ticker, qty, stop_side, stop_price)
-
+        stop_ok = submit_stop_loss(ticker, qty, stop_side, stop_price)
         if stop_ok:
             recent_signals[f"{ticker}_{direction}"] = 0
-            trade_history.append({"ticker": ticker, "direction": direction, "entry_price": live_price, "misfit": name, "executed": True, "timestamp": datetime.now(pytz.utc).isoformat()})
+            trade_history.append({"ticker": ticker, "direction": direction, "entry_price": entry_price, "misfit": name, "executed": True, "timestamp": datetime.now(pytz.utc).isoformat()})
             save_log()
-            return f"Executed: {direction.upper()} {qty} {ticker} at ${live_price:.2f} | Stop: ${stop_price:.2f}"
-        else:
-            return f"{ticker} position closed -- stop loss failed"
+            return f"Executed: {direction.upper()} {qty} {ticker} at ${entry_price:.4f} | Stop: ${stop_price:.4f}"
+        return f"{ticker} position closed -- stop loss submission failed"
     except Exception as e:
-        return f"Execution failed: {e}"
+        return f"Execution error: {e}"
 
-def update_training_loop(ticker, misfit_name, outcome_pnl_pct):
-    trade_was_profitable = outcome_pnl_pct > 0
-    if misfit_name in misfit_scorecard:
-        misfit_scorecard[misfit_name]["total"] += 1
-        if trade_was_profitable:
-            misfit_scorecard[misfit_name]["correct"] += 1
-    save_log()
 
 def check_stop_losses(portfolio_state):
-    try:
-        if portfolio_state is None:
-            return
-        for symbol, pos in portfolio_state["positions"].items():
-            unrealized_pct = pos["unrealized_pct"]
-            side = pos["side"]
-            stop_triggered = (side == "long" and unrealized_pct <= -5) or (side == "short" and unrealized_pct <= -5)
-            if stop_triggered:
+    if portfolio_state is None: return
+    for symbol, pos in portfolio_state["positions"].items():
+        if pos["unrealized_pct"] <= -5:
+            try:
                 close_position(symbol)
                 result = f"+${abs(pos['unrealized_pnl']):,.0f}" if pos["unrealized_pnl"] >= 0 else f"-${abs(pos['unrealized_pnl']):,.0f}"
-                send_performance(f"""🛑 STOP LOSS TRIGGERED
+                send_performance(f"🛑 STOP LOSS\n\nClosed {symbol}\nResult: {result} ({pos['unrealized_pct']:+.1f}%)\nCapital protected.\n\n-- Satis House Consulting")
+                misfit_name = next((t.get("misfit", "") for t in reversed(trade_history) if t.get("ticker") == symbol), "")
+                if misfit_name and misfit_name in misfit_scorecard:
+                    misfit_scorecard[misfit_name]["total"] += 1
+                    save_log()
+            except Exception as e:
+                print(f"Stop loss error {symbol}: {e}")
 
-Closed {symbol}
-Result: {result} ({unrealized_pct:+.1f}%)
-Capital protected.
 
--- Satis House Consulting""")
-                misfit_name = ""
-                for trade in reversed(trade_history):
-                    if trade.get("ticker") == symbol:
-                        misfit_name = trade.get("misfit", "")
-                        break
-                if misfit_name:
-                    update_training_loop(symbol, misfit_name, unrealized_pct / 100)
-    except Exception as e:
-        print(f"Stop loss error: {e}")
+def close_friday_shorts(portfolio_state):
+    if not portfolio_state: return
+    for symbol, pos in portfolio_state["positions"].items():
+        if pos["side"] == "short":
+            try:
+                close_position(symbol)
+                result = f"+${abs(pos['unrealized_pnl']):,.0f}" if pos["unrealized_pnl"] >= 0 else f"-${abs(pos['unrealized_pnl']):,.0f}"
+                send_performance(f"📅 FRIDAY CLOSE\n\nClosed short {symbol} before weekend.\nResult: {result} ({pos['unrealized_pct']:+.1f}%)\n\n-- Satis House Consulting")
+            except Exception as e:
+                print(f"Friday close error {symbol}: {e}")
 
-def report_open_positions(portfolio_state):
-    try:
-        if portfolio_state is None:
-            return
-        daily_pnl = None
-        if daily_start_value and portfolio_state:
-            daily_pnl = (portfolio_state["portfolio_value"] - daily_start_value) / daily_start_value
-        send_performance(format_position_report(portfolio_state, daily_pnl))
-    except Exception as e:
-        print(f"Position report error: {e}")
+
+def report_positions(portfolio_state):
+    if portfolio_state is None: return
+    daily_pnl = (portfolio_state["portfolio_value"] - daily_start_value) / daily_start_value if daily_start_value else None
+    send_performance(format_position_report(portfolio_state, daily_pnl))
+
+
+# ── AIS STREAM ────────────────────────────────────────────────────────────────
 
 def start_aisstream():
     def on_message(ws, message):
@@ -969,142 +900,98 @@ def start_aisstream():
                 meta = data.get("MetaData", {})
                 pos_data = data.get("Message", {}).get("PositionReport", {})
                 with hormuz_lock:
-                    hormuz_vessels.append({
-                        "name": meta.get("ShipName", "Unknown"),
-                        "lat": pos_data.get("Latitude", 0),
-                        "lon": pos_data.get("Longitude", 0),
-                        "speed": pos_data.get("Sog", 0),
-                        "timestamp": datetime.now(pytz.utc).isoformat()
-                    })
-                    if len(hormuz_vessels) > 100:
-                        hormuz_vessels.pop(0)
-        except:
-            pass
+                    hormuz_vessels.append({"name": meta.get("ShipName", "?"), "lat": pos_data.get("Latitude", 0), "lon": pos_data.get("Longitude", 0), "speed": pos_data.get("Sog", 0)})
+                    if len(hormuz_vessels) > 100: hormuz_vessels.pop(0)
+        except: pass
 
     def on_open(ws):
-        ws.send(json.dumps({
-            "APIKey": AISSTREAM_API_KEY,
-            "MessageType": "Subscribe",
-            "BoundingBoxes": [[[21.0, 55.0], [27.0, 62.0]]],
-            "FilterMessageTypes": ["PositionReport"]
-        }))
-        print("AISStream subscribed to Hormuz")
-
-    def on_error(ws, error):
-        print(f"AISStream error: {error}")
-
-    def on_close(ws, *args):
-        time.sleep(60)
-        start_aisstream()
+        ws.send(json.dumps({"APIKey": AISSTREAM_API_KEY, "MessageType": "Subscribe", "BoundingBoxes": [[[21.0, 55.0], [27.0, 62.0]]], "FilterMessageTypes": ["PositionReport"]}))
+        print("AISStream: monitoring Hormuz")
 
     def run():
-        ws = websocket.WebSocketApp(
-            "wss://stream.aisstream.io/v0/stream",
-            on_open=on_open, on_message=on_message,
-            on_error=on_error, on_close=on_close
-        )
-        ws.run_forever()
+        while True:
+            try:
+                ws = websocket.WebSocketApp("wss://stream.aisstream.io/v0/stream", on_open=on_open, on_message=on_message, on_error=lambda ws, e: print(f"AIS error: {e}"), on_close=lambda ws, *a: None)
+                ws.run_forever()
+            except:
+                pass
+            time.sleep(60)
 
     threading.Thread(target=run, daemon=True).start()
-    print("AISStream monitoring Hormuz")
+
 
 def keepalive():
     try:
         get_account()
         print(f"Keepalive {datetime.now(pytz.utc).strftime('%H:%M:%S')}")
-    except:
-        pass
+    except: pass
 
-def smart_sleep(total_seconds):
-    interval = 480
+
+def smart_sleep(seconds):
     elapsed = 0
-    while elapsed < total_seconds:
-        sleep_chunk = min(interval, total_seconds - elapsed)
-        time.sleep(sleep_chunk)
-        elapsed += sleep_chunk
-        if elapsed < total_seconds:
-            keepalive()
+    while elapsed < seconds:
+        chunk = min(480, seconds - elapsed)
+        time.sleep(chunk)
+        elapsed += chunk
+        if elapsed < seconds: keepalive()
 
-MISFIT_CONFIGS = [
-    (
-        "Soros",
-        """You ARE George Soros. You see markets through the lens of reflexivity -- self-reinforcing feedback loops that eventually collapse.
 
-Your specialty data focuses on: currency stress, sovereign debt, emerging market capital flows, central bank reserve depletion.
+# ── MISFIT PERSONAS ───────────────────────────────────────────────────────────
 
-Find the single best trade available RIGHT NOW from the live prices above. Lead with your specialty data but trade anything where you see a reflexivity feedback loop or unsustainable narrative. Every asset class is available to you.""",
-        ["George Soros reflexivity currency crisis Black Wednesday methodology",
-         "Soros Fund Management macro views sovereign debt 2025 2026"]
-    ),
-    (
-        "Druckenmiller",
-        """You ARE Stanley Druckenmiller. You never think about what you can make -- only what you can lose. Your stop is sacred.
+MISFITS = [
+    ("Soros",
+     """You ARE George Soros. You see reflexivity everywhere -- self-reinforcing feedback loops that eventually collapse. You broke the Bank of England. You find the lie everyone believes and bet against it when defenders run out of ammunition. Your specialist data covers currency stress, sovereign debt, emerging market capital flows, and central bank reserve positions. Trade anything where you see an unsustainable narrative or reflexivity reversal.""",
+     ["George Soros reflexivity currency crisis Black Wednesday 1992",
+      "Soros Fund Management macro sovereign debt views 2025 2026"]),
 
-Your specialty data focuses on: credit spreads, Federal Reserve balance sheet, macro momentum, earnings revisions.
+    ("Druckenmiller",
+     """You ARE Stanley Druckenmiller. You think about what you can lose before what you can make. Your stop is sacred. You concentrate into your single best idea when conviction is high. Your specialist data covers credit spreads, Federal Reserve balance sheet, macro momentum across asset classes, and earnings revisions. Trade the highest conviction asymmetric opportunity you can find anywhere in the market.""",
+     ["Stanley Druckenmiller concentration asymmetric bet stop loss methodology",
+      "Druckenmiller macro credit Federal Reserve views 2025 2026"]),
 
-Find the single best asymmetric trade available RIGHT NOW from the live prices above. Lead with your credit and macro data but trade anything where risk reward is extraordinary. Every asset class is available to you.""",
-        ["Stanley Druckenmiller concentration asymmetric macro stop loss methodology",
-         "Druckenmiller macro views credit Federal Reserve 2025 2026"]
-    ),
-    (
-        "PTJ",
-        """You ARE Paul Tudor Jones. You never get out of bed for less than 5 to 1. The chart is the truth.
+    ("PTJ",
+     """You ARE Paul Tudor Jones. You called Black Monday 1987. You never trade for less than 5 to 1 risk reward. The chart tells the truth before the fundamentals do. Your specialist data covers VIX regime, volume breakouts, momentum signals, and technical structure. Find the cleanest technical setup with the most defined risk in the market right now.""",
+     ["Paul Tudor Jones 5 to 1 risk reward Black Monday technical analysis",
+      "PTJ trend following technical momentum views 2025 2026"]),
 
-Your specialty data focuses on: VIX regime, volume breakouts, momentum, technical structure.
+    ("Tepper",
+     """You ARE David Tepper. You made 7 billion dollars in 2009 reading the government's intent before the market did. When the Federal Reserve is on your side you buy everything. Your specialist data covers high yield spreads, Treasury yields, credit delinquency rates, and Federal Reserve policy signals. Find the trade where policy backstop creates asymmetric upside.""",
+     ["David Tepper 2009 bank trade Federal Reserve policy reading",
+      "Tepper credit Fed policy macro views 2025 2026"]),
 
-Find the single best technical setup available RIGHT NOW from the live prices above. Lead with your volatility and momentum data but trade anything showing a clean technical setup with defined risk. Every asset class is available to you.""",
-        ["Paul Tudor Jones 5 to 1 risk reward Black Monday technical analysis",
-         "PTJ macro views trend following technical 2025 2026"]
-    ),
-    (
-        "Tepper",
-        """You ARE David Tepper. You read the Federal Reserve before the market does. When the government decides something will not fail, you buy it.
-
-Your specialty data focuses on: credit spreads, Treasury yields, delinquency rates, Federal Reserve policy signals.
-
-Find the single best policy-driven trade available RIGHT NOW from the live prices above. Lead with your credit and rates data but trade anything where policy backstop creates asymmetric opportunity. Every asset class is available to you.""",
-        ["David Tepper 2009 bank trade Federal Reserve policy reading methodology",
-         "Tepper macro views credit Fed policy 2025 2026"]
-    ),
-    (
-        "Andurand",
-        """You ARE Pierre Andurand. Physical markets always lead paper markets. You track molecules, not narratives.
-
-Your specialty data focuses on: Cushing storage draws, Hormuz vessel traffic, crack spreads, crude futures positioning, oil-linked currencies.
-
-Find the single best energy or commodity trade available RIGHT NOW from the live prices above. Lead with your physical market data but also trade currencies of oil exporters and importers, shipping stocks, refiners, and any asset where physical reality diverges from paper price. Every asset class is available to you.""",
-        ["Pierre Andurand physical commodity flows Hormuz oil 2008 2022 methodology",
-         "Andurand Capital oil energy physical market views 2025 2026"]
-    )
+    ("Andurand",
+     """You ARE Pierre Andurand. Physical markets always lead paper markets. You track molecules not narratives. You called 2008 oil and 2022 Russia Ukraine energy crisis by reading physical flows before they showed in price. Your specialist data covers Cushing storage draws, Hormuz vessel traffic, crude futures positioning, crack spreads, and oil-linked currencies. Find the energy or commodity trade where physical reality diverges from paper price.""",
+     ["Pierre Andurand physical commodity flows Hormuz oil 2008 2022",
+      "Andurand Capital energy oil physical market views 2025 2026"])
 ]
 
-misfit_knowledge_cache = {}
-misfit_data_cache = {}
+misfit_knowledge = {}
+misfit_data = {}
 knowledge_refresh_cycles = 8
 cycle_count = 0
 
+
+# ── MAIN LOOP ─────────────────────────────────────────────────────────────────
+
 def send_startup_message():
-    send_performance("""🚀 MISFITS SYSTEM ONLINE -- CONTEST MODEL
+    send_performance("""🚀 MISFITS CONTEST MODEL -- LIVE
 
 Five legendary traders. One contest every 15 minutes.
 
-Each Misfit independently scans the full market using their own live data. Every signal uses confirmed live prices -- no hallucination possible.
-
-The scoring system:
-Risk reward × conviction × environment weight × Bayesian win rate
-
-Top scoring signal executes. Quarter-Kelly position sizing.
-Two signals can execute simultaneously if they do not conflict.
+PRICING GUARANTEE:
+All prices fetched live from market data API before any Misfit speaks.
+Claude outputs ONLY ticker and direction -- never a price.
+Entry = live price. Stop = 5% from live. Target = 15% from live.
+Zero hallucination possible by architecture.
 
 Competing against OmniscientBot on a separate account.
-May the best system win.
 
 -- Satis House Consulting""")
 
+
 def run_cycle():
-    global cycle_count, misfit_knowledge_cache, misfit_data_cache
-    global daily_start_value, trades_halted_today, recent_signals, orders_this_cycle
-    global daily_scorecard_sent
+    global cycle_count, misfit_knowledge, misfit_data
+    global daily_start_value, trades_halted_today, recent_signals, orders_this_cycle, daily_scorecard_sent
 
     cycle_count += 1
     orders_this_cycle = 0
@@ -1113,11 +1000,9 @@ def run_cycle():
     now_et = datetime.now(et)
 
     if now_et.hour == 9 and now_et.minute < 15 and not daily_scorecard_sent:
-        portfolio_state = get_portfolio_state()
-        send_performance(format_daily_scorecard(portfolio_state))
+        send_performance(format_daily_scorecard(get_portfolio_state()))
         daily_scorecard_sent = True
-
-    if now_et.hour == 9 and now_et.minute >= 15:
+    if now_et.hour >= 9 and now_et.minute >= 15:
         daily_scorecard_sent = False
 
     if now_et.hour == 9 and now_et.minute < 30:
@@ -1145,93 +1030,90 @@ def run_cycle():
         portfolio_state = get_portfolio_state()
 
     if cycle_count % 4 == 0:
-        report_open_positions(portfolio_state)
+        report_positions(portfolio_state)
 
-    live_prices = get_all_live_prices()
+    live_prices = fetch_all_live_prices()
+    price_table = build_price_table(live_prices)
 
     if cycle_count % knowledge_refresh_cycles == 1:
-        print("Refreshing Misfit knowledge and data...")
-        data_funcs = {
-            "Soros": get_soros_data,
-            "Druckenmiller": get_druckenmiller_data,
-            "PTJ": get_ptj_data,
-            "Tepper": get_tepper_data,
-            "Andurand": get_andurand_data
-        }
-        for name, task, queries in MISFIT_CONFIGS:
-            print(f"  Refreshing {name}...")
+        print("Refreshing Misfit knowledge and specialist data...")
+        data_funcs = {"Soros": get_soros_data, "Druckenmiller": get_druckenmiller_data, "PTJ": get_ptj_data, "Tepper": get_tepper_data, "Andurand": get_andurand_data}
+        for name, persona, queries in MISFITS:
             blocks = []
             for q in queries:
                 try:
-                    results = exa.search_and_contents(q, num_results=2, text={"max_characters": 400})
-                    for r in results.results:
+                    res = exa.search_and_contents(q, num_results=2, text={"max_characters": 400})
+                    for r in res.results:
                         blocks.append(f"{r.title}: {r.text[:300]}")
                     time.sleep(1)
-                except:
-                    pass
-            misfit_knowledge_cache[name] = "\n\n".join(blocks)
-            misfit_data_cache[name] = data_funcs[name]()
+                except: pass
+            misfit_knowledge[name] = "\n\n".join(blocks)
+            misfit_data[name] = data_funcs[name]()
             time.sleep(2)
 
     market_open = is_market_hours()
     market_note = ""
     if not market_open:
-        market_note = "\nMARKET CLOSED: Only generate signals for BTC/USD, ETH/USD, or SOL/USD which trade 24/7."
+        market_note = "MARKET CLOSED: Only pick BTC-USD, ETH-USD, or SOL-USD which trade 24/7. All other tickers are unavailable."
     if is_friday_short_blocked():
-        market_note += "\nFRIDAY RULE: No SHORT signals after 2 PM ET."
+        market_note += " FRIDAY RULE: DIRECTION must be BUY only after 2 PM ET."
+
+    env_active = [k for k, v in environment.items() if v]
+    print(f"Cycle {cycle_count} | VIX {vix:.1f} | Env: {env_active or 'standard'} | Running contest...")
 
     signals_scored = {}
     signal_texts = {}
-    print(f"Cycle {cycle_count}: running Misfit contest...")
 
-    for name, task, queries in MISFIT_CONFIGS:
-        data = misfit_data_cache.get(name, {})
-        knowledge = misfit_knowledge_cache.get(name, "")
+    for name, persona, queries in MISFITS:
+        data = misfit_data.get(name, {})
+        knowledge = misfit_knowledge.get(name, "")
         weight = misfit_scorecard.get(name, {}).get("weight", 1.0)
-        full_task = task + market_note
 
-        raw_text = generate_misfit_signal(name, full_task, data, knowledge, weight, live_prices)
-        signal_texts[name] = raw_text
-        parsed = parse_misfit_signal(raw_text, live_prices)
+        raw = generate_misfit_signal(name, persona, data, knowledge, weight, price_table, market_note)
+        signal_texts[name] = raw
+        parsed = parse_signal_output(raw, live_prices)
         score = score_signal(parsed, name, environment)
         signals_scored[name] = (parsed, score)
 
-        fired = parsed is not None and score >= MIN_SIGNAL_SCORE
-        session_stats["misfit_signals"][name]["fired" if fired else "skipped"] += 1
-        print(f"  {name}: {'SIGNAL ' + parsed['ticker'] + ' score=' + str(score) if parsed else 'no signal'}")
+        if parsed and score >= MIN_SIGNAL_SCORE:
+            session_stats["misfit_signals"][name]["fired"] += 1
+            print(f"  {name}: SIGNAL {parsed['ticker']} {parsed['direction'].upper()} @ ${parsed['entry']:.4f} score={score:.3f}")
+        else:
+            session_stats["misfit_signals"][name]["skipped"] += 1
+            print(f"  {name}: score={score:.3f} -- below threshold")
 
     winners = run_contest(signals_scored)
     session_stats["total"] += 1
 
-    telegram_brief = f"MISFITS CONTEST -- CYCLE {cycle_count}\n\n"
+    brief = f"MISFITS CONTEST -- CYCLE {cycle_count}\nEnvironment: {', '.join(env_active) if env_active else 'standard'}\n\n"
     for name, (signal, score) in signals_scored.items():
         weight = misfit_scorecard.get(name, {}).get("weight", 1.0)
         if signal:
-            telegram_brief += f"{name.upper()} ({weight:.1f}x): {signal['ticker']} {signal['direction'].upper()} @ ${signal['entry']:.2f} score={score:.2f}\n"
+            brief += f"{name} ({weight:.1f}x): {signal['ticker']} {signal['direction'].upper()} score={score:.3f}\n"
         else:
-            telegram_brief += f"{name.upper()} ({weight:.1f}x): no signal\n"
+            brief += f"{name} ({weight:.1f}x): no valid signal\n"
 
     if winners:
         session_stats["execute"] += 1
         save_log()
-        telegram_brief += f"\nWINNERS: {', '.join([w[0] for w in winners])}\n"
+        brief += f"\nWINNERS:"
         for win_name, win_signal, win_score in winners:
-            portfolio_value = portfolio_state["portfolio_value"] if portfolio_state else INCEPTION_VALUE
-            position_size = kelly_size(win_signal, win_name, portfolio_value)
+            pv = portfolio_state["portfolio_value"] if portfolio_state else INCEPTION_VALUE
+            pos_size = kelly_size(win_signal, win_name, pv)
             if vix >= VIX_REDUCE_THRESHOLD:
-                position_size *= 0.5
-            result = execute_winner(win_name, win_signal, position_size, portfolio_state, vix)
-            perf_msg = format_trade_alert(win_name, win_signal, position_size, win_score)
-            send_performance(perf_msg)
-            telegram_brief += f"\nEXECUTION ({win_name}): {result}"
+                pos_size *= 0.5
+            result = execute_winner(win_name, win_signal, pos_size, portfolio_state, vix)
+            send_performance(format_trade_alert(win_name, win_signal, pos_size, win_score))
+            brief += f"\n  {win_name}: {result}"
     else:
         session_stats["pass"] += 1
         save_log()
-        telegram_brief += f"\nNo signal scored above threshold ({MIN_SIGNAL_SCORE}). No trade this cycle."
+        brief += f"\nNo signal scored above {MIN_SIGNAL_SCORE}. No trade this cycle."
 
-    send_telegram(telegram_brief)
-    print(f"Cycle {cycle_count}: {'EXECUTED ' + str(len(winners)) + ' trades' if winners else 'NO TRADE'}")
+    send_telegram(brief)
+    print(f"Cycle {cycle_count} done: {'EXECUTED' if winners else 'NO TRADE'}")
     smart_sleep(900)
+
 
 while True:
     try:
