@@ -1,6 +1,12 @@
 # Satis House Consulting -- YoniBot and The Misfits
 Last updated: May 11 2026
 
+## CRITICAL RULE -- LIVE PRICING ALWAYS
+Claude NEVER outputs prices. Claude outputs ONLY ticker and direction.
+All prices come from get_live_price() via yfinance.
+Entry = live price. Stop = 5% from live. Target = 15% from live.
+This is non-negotiable and must survive every future rewrite.
+
 ## System Status
 Both systems running 24/7 on Railway. Paper trading active.
 Alpaca identity verification pending -- options live when approved.
