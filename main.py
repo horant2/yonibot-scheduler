@@ -27,6 +27,14 @@ ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 LOG_FILE = "/tmp/misfits_log.json"
 INCEPTION_VALUE = 100000
 
+THESIS_FILES = {
+    "Soros": "/tmp/soros_thesis.json",
+    "Druckenmiller": "/tmp/druckenmiller_thesis.json",
+    "PTJ": "/tmp/ptj_thesis.json",
+    "Tepper": "/tmp/tepper_thesis.json",
+    "Andurand": "/tmp/andurand_thesis.json"
+}
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 exa = Exa(api_key=EXA_API_KEY)
 
@@ -111,10 +119,9 @@ def get_live_price(ticker):
     if ticker in live_price_cache and (now - price_cache_timestamps.get(ticker, 0)) < PRICE_CACHE_TTL:
         return live_price_cache[ticker]
     try:
-        yf_ticker = ticker
-        data = yf.download(yf_ticker, period="2d", interval="1m", progress=False, auto_adjust=True)
+        data = yf.download(ticker, period="2d", interval="1m", progress=False, auto_adjust=True)
         if data.empty:
-            data = yf.download(yf_ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
+            data = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
         if not data.empty:
             price = float(data["Close"].squeeze().dropna().iloc[-1])
             live_price_cache[ticker] = price
@@ -173,6 +180,80 @@ def apply_live_price(ticker, direction, prices):
         "loss_size": loss_size,
         "risk_reward": round(risk_reward, 2)
     }
+
+
+# ── THESIS PERSISTENCE ────────────────────────────────────────────────────────
+# Each Misfit maintains a persistent thesis written after every cycle.
+# The thesis is read back at the start of the next cycle.
+# Signal flows FROM the thesis, not FROM the news headline.
+# This is what separates a macro trader from a reactive trader.
+# Thesis resets on container restart and rebuilds within a few cycles. Acceptable.
+
+def read_thesis(name):
+    path = THESIS_FILES.get(name)
+    if not path:
+        return ""
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                data = json.load(f)
+            view = data.get("current_view", "")
+            conviction = data.get("conviction", "")
+            age = data.get("thesis_age_cycles", 0)
+            if view:
+                return (
+                    f"YOUR PERSISTENT THESIS (built over {age} cycles -- do not abandon without new evidence):\n"
+                    f"View: {view}\n"
+                    f"Conviction: {conviction}/10\n\n"
+                    f"Check new data against this thesis. If data confirms it, raise conviction and signal from it. "
+                    f"If data contradicts it, explain why in your THESIS update. "
+                    f"Do not flip your thesis on noise. Only flip on meaningful new information."
+                )
+    except Exception as e:
+        print(f"Thesis read error {name}: {e}")
+    return ""
+
+
+def save_thesis(name, raw_output):
+    path = THESIS_FILES.get(name)
+    if not path:
+        return
+    try:
+        thesis_line = ""
+        score_line = ""
+        for line in raw_output.strip().split("\n"):
+            if line.upper().startswith("THESIS:"):
+                thesis_line = line.split(":", 1)[1].strip()
+            if line.upper().startswith("SCORE:"):
+                score_line = line.split(":", 1)[1].strip()
+
+        if not thesis_line:
+            return
+
+        existing_age = 0
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    existing = json.load(f)
+                existing_age = existing.get("thesis_age_cycles", 0)
+            except:
+                pass
+
+        try:
+            conviction = float(score_line)
+        except:
+            conviction = 5.0
+
+        with open(path, "w") as f:
+            json.dump({
+                "current_view": thesis_line,
+                "conviction": conviction,
+                "thesis_age_cycles": existing_age + 1,
+                "last_updated": datetime.now(pytz.utc).isoformat()
+            }, f, indent=2)
+        print(f"  {name} thesis saved (age {existing_age + 1}): {thesis_line[:80]}...")
+    except Exception as e:
+        print(f"Thesis save error {name}: {e}")
 
 
 # ── PERSISTENT LOG ────────────────────────────────────────────────────────────
@@ -411,18 +492,23 @@ def get_andurand_data():
 
 
 # ── MISFIT SIGNAL GENERATION ──────────────────────────────────────────────────
-# Claude outputs ONLY: TICKER and DIRECTION.
+# Claude outputs ONLY: TICKER, DIRECTION, SCORE, REASON, THESIS.
 # Claude NEVER outputs a price. Prices come from the live price engine above.
+# THESIS is written to disk after every cycle and read back before the next.
+# This is how a real macro trader builds conviction over time instead of
+# reacting to every headline from a blank slate.
 
-def generate_misfit_signal(name, persona, specialist_data, knowledge, weight, price_table, market_note):
+def generate_misfit_signal(name, persona, specialist_data, knowledge, weight, price_table, market_note, thesis_context=""):
     weight_note = f"\nYour environment weight is {weight:.1f}x -- this is your moment, be aggressive." if weight > 1.0 else ""
     data_str = json.dumps(specialist_data, default=str)[:1500]
     knowledge_str = knowledge[:600] if knowledge else ""
     sc = misfit_scorecard.get(name, {})
     record = f"Your record: {sc.get('correct',0)}/{sc.get('total',0)} correct." if sc.get("total", 0) > 0 else "No closed trades yet."
 
-    prompt = f"""{persona}{weight_note}
+    thesis_block = f"\n{thesis_context}\n" if thesis_context else ""
 
+    prompt = f"""{persona}{weight_note}
+{thesis_block}
 {price_table}
 
 YOUR SPECIALIST DATA:
@@ -436,22 +522,26 @@ YOUR KNOWLEDGE BASE:
 {market_note}
 
 YOUR TASK:
-Study your specialist data. Find the single best trade available right now.
+If you have a persistent thesis above, check whether new data confirms, weakens, or flips it.
+Do not abandon a thesis on noise. Only revise it when new evidence is meaningful.
+Find the single best trade that flows from your current view of the world.
 Pick ONE ticker from the verified price list above.
 Pick a direction: BUY or SHORT.
-Give a conviction score 1-10 based on how strongly your data supports this trade.
+Give a conviction score 1-10 based on how strongly your thesis and data support this trade.
 Give one sentence of reasoning from YOUR specific framework.
+Write one precise thesis sentence that will be read back to you next cycle.
 
-CRITICAL: You output EXACTLY four lines. Nothing else. No prices. No explanation.
+CRITICAL: You output EXACTLY five lines. Nothing else. No prices. No explanation.
 
 TICKER: [ticker exactly as shown in the price list]
 DIRECTION: [BUY or SHORT]
 SCORE: [1-10]
-REASON: [one sentence from your specific framework and data]"""
+REASON: [one sentence from your specific framework and data]
+THESIS: [one sentence -- your current market view, updated by what you just saw, persists to next cycle]"""
 
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
-        max_tokens=120,
+        max_tokens=150,
         messages=[{"role": "user", "content": prompt}]
     )
     return msg.content[0].text.strip()
@@ -638,6 +728,20 @@ def format_daily_scorecard(portfolio_state=None):
         record = f"{sc.get('correct',0)}/{sc.get('total',0)}" if sc.get("total", 0) > 0 else "no trades"
         weight = sc.get("weight", 1.0)
         lines.append(f"  {name}: {votes['fired']}/{total_v} signals ({rate:.0f}%) | {record} | {weight:.1f}x")
+    lines.append("\nActive theses:")
+    for name in THESIS_FILES:
+        path = THESIS_FILES[name]
+        try:
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    t = json.load(f)
+                age = t.get("thesis_age_cycles", 0)
+                view = t.get("current_view", "")[:70]
+                lines.append(f"  {name} ({age} cycles): {view}...")
+            else:
+                lines.append(f"  {name}: no thesis yet")
+        except:
+            lines.append(f"  {name}: thesis unreadable")
     lines.append(net_line)
     lines.append("\n-- Satis House Consulting")
     return "\n".join(lines)
@@ -977,6 +1081,7 @@ def send_startup_message():
     send_performance("""🚀 MISFITS CONTEST MODEL -- LIVE
 
 Five legendary traders. One contest every 15 minutes.
+Thesis persistence layer active -- all five Misfits now build conviction across cycles.
 
 PRICING GUARANTEE:
 All prices fetched live from market data API before any Misfit speaks.
@@ -1069,7 +1174,14 @@ def run_cycle():
         knowledge = misfit_knowledge.get(name, "")
         weight = misfit_scorecard.get(name, {}).get("weight", 1.0)
 
-        raw = generate_misfit_signal(name, persona, data, knowledge, weight, price_table, market_note)
+        # Read this Misfit's persistent thesis before they speak
+        thesis_context = read_thesis(name)
+
+        raw = generate_misfit_signal(name, persona, data, knowledge, weight, price_table, market_note, thesis_context)
+
+        # Save updated thesis immediately after signal generation
+        save_thesis(name, raw)
+
         signal_texts[name] = raw
         parsed = parse_signal_output(raw, live_prices)
         score = score_signal(parsed, name, environment)
