@@ -1,8 +1,10 @@
 anthropic
-requests
 yfinance
 pandas
 numpy
 exa-py
 pytz
 websocket-client
+requests
+hmmlearn
+scikit-learn
