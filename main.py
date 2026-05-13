@@ -11,6 +11,7 @@ import pytz
 import json
 import websocket
 import threading
+from hmmlearn import hmm as hmmlearn_hmm
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -84,6 +85,16 @@ orders_this_cycle = 0
 hormuz_vessels = []
 hormuz_lock = threading.Lock()
 daily_scorecard_sent = False
+
+# HMM models trained at startup, refreshed daily
+# Each model is a tuple: (fitted_GaussianHMM, crisis_state_index)
+# crisis_state_index is determined after training by examining state means
+hmm_models = {
+    "energy_crisis": None,
+    "credit_crisis": None,
+    "currency_crisis": None,
+    "market_crash": None
+}
 
 misfit_scorecard = {
     "Soros": {"correct": 0, "total": 0, "weight": 1.0},
@@ -180,6 +191,250 @@ def apply_live_price(ticker, direction, prices):
         "loss_size": loss_size,
         "risk_reward": round(risk_reward, 2)
     }
+
+
+# ── HMM ENVIRONMENT DETECTION ─────────────────────────────────────────────────
+# Replaces binary detect_environment() with continuous probability scores.
+# Each environment has its own 3-state Gaussian HMM trained on specialist emissions.
+# Crisis state is identified by examining state means after training.
+# Output: probability 0.0 to 1.0 of currently being in crisis regime.
+# This detects regime transitions BEFORE price confirms them.
+# Trained at startup. Retrained daily at 9 AM alongside scorecard.
+# Falls back to binary threshold detection if HMM fails.
+
+def _fetch_returns(ticker, period="3y"):
+    try:
+        data = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+        return data["Close"].squeeze().pct_change().dropna()
+    except:
+        return pd.Series(dtype=float)
+
+
+def _align_series(*series_list):
+    if not series_list:
+        return None
+    common = series_list[0].index
+    for s in series_list[1:]:
+        common = common.intersection(s.index)
+    aligned = [s.loc[common].values for s in series_list]
+    if len(common) < 60:
+        return None
+    return np.column_stack(aligned), len(common)
+
+
+def _fit_hmm(X, n_states=3):
+    best_model = None
+    best_score = -np.inf
+    for seed in [42, 7, 99]:
+        try:
+            model = hmmlearn_hmm.GaussianHMM(
+                n_components=n_states,
+                covariance_type="full",
+                n_iter=300,
+                random_state=seed,
+                tol=1e-4
+            )
+            model.fit(X)
+            score = model.score(X)
+            if score > best_score:
+                best_score = score
+                best_model = model
+        except:
+            pass
+    return best_model
+
+
+def train_environment_hmms():
+    global hmm_models
+    print("Training environment HMMs on 3 years of historical data...")
+
+    # energy_crisis: USO and BNO daily returns
+    # Crisis state = highest mean return (oil price spike)
+    try:
+        uso_r = _fetch_returns("USO")
+        bno_r = _fetch_returns("BNO")
+        result = _align_series(uso_r, bno_r)
+        if result:
+            X, n_obs = result
+            model = _fit_hmm(X)
+            if model:
+                # crisis = state with highest mean USO return (oil spike)
+                uso_means = [model.means_[i][0] for i in range(3)]
+                crisis_idx = int(np.argmax(uso_means))
+                hmm_models["energy_crisis"] = (model, crisis_idx)
+                print(f"  energy_crisis HMM trained on {n_obs} obs | crisis state {crisis_idx} mean USO={uso_means[crisis_idx]:.4f}")
+    except Exception as e:
+        print(f"  energy_crisis HMM failed: {e}")
+
+    # credit_crisis: HYG and LQD daily returns
+    # Crisis state = lowest mean return (credit selling off)
+    try:
+        hyg_r = _fetch_returns("HYG")
+        lqd_r = _fetch_returns("LQD")
+        result = _align_series(hyg_r, lqd_r)
+        if result:
+            X, n_obs = result
+            model = _fit_hmm(X)
+            if model:
+                hyg_means = [model.means_[i][0] for i in range(3)]
+                crisis_idx = int(np.argmin(hyg_means))
+                hmm_models["credit_crisis"] = (model, crisis_idx)
+                print(f"  credit_crisis HMM trained on {n_obs} obs | crisis state {crisis_idx} mean HYG={hyg_means[crisis_idx]:.4f}")
+    except Exception as e:
+        print(f"  credit_crisis HMM failed: {e}")
+
+    # currency_crisis: UUP and inverse FXE daily returns
+    # Crisis state = highest absolute UUP move (extreme dollar stress either direction)
+    try:
+        uup_r = _fetch_returns("UUP")
+        fxe_r = _fetch_returns("FXE")
+        result = _align_series(uup_r, fxe_r)
+        if result:
+            X, n_obs = result
+            model = _fit_hmm(X)
+            if model:
+                # crisis = state with highest variance (extreme moves)
+                uup_vars = [model.covars_[i][0][0] for i in range(3)]
+                crisis_idx = int(np.argmax(uup_vars))
+                hmm_models["currency_crisis"] = (model, crisis_idx)
+                print(f"  currency_crisis HMM trained on {n_obs} obs | crisis state {crisis_idx} UUP var={uup_vars[crisis_idx]:.6f}")
+    except Exception as e:
+        print(f"  currency_crisis HMM failed: {e}")
+
+    # market_crash: SPY returns and VIX normalized to same scale as returns
+    # Crisis state = lowest SPY mean return (market falling)
+    try:
+        spy_r = _fetch_returns("SPY")
+        vix_raw = yf.download("^VIX", period="3y", progress=False)["Close"].squeeze().dropna()
+        vix_r = vix_raw.pct_change().dropna()
+        result = _align_series(spy_r, vix_r)
+        if result:
+            X, n_obs = result
+            model = _fit_hmm(X)
+            if model:
+                spy_means = [model.means_[i][0] for i in range(3)]
+                crisis_idx = int(np.argmin(spy_means))
+                hmm_models["market_crash"] = (model, crisis_idx)
+                print(f"  market_crash HMM trained on {n_obs} obs | crisis state {crisis_idx} mean SPY={spy_means[crisis_idx]:.4f}")
+    except Exception as e:
+        print(f"  market_crash HMM failed: {e}")
+
+    print("HMM training complete.")
+
+
+def _get_crisis_probability(env_key, recent_X):
+    entry = hmm_models.get(env_key)
+    if entry is None:
+        return None
+    model, crisis_idx = entry
+    try:
+        posteriors = model.predict_proba(recent_X)
+        return float(posteriors[-1][crisis_idx])
+    except:
+        return None
+
+
+def detect_environment():
+    # Returns continuous probabilities 0.0 to 1.0 for each environment.
+    # Values above 0.1 are meaningful. Values above 0.5 are significant.
+    # Falls back to binary threshold detection if HMM model unavailable.
+    env = {"energy_crisis": 0.0, "credit_crisis": 0.0, "currency_crisis": 0.0, "market_crash": 0.0}
+
+    # energy_crisis
+    try:
+        uso_r = _fetch_returns("USO", period="90d")
+        bno_r = _fetch_returns("BNO", period="90d")
+        result = _align_series(uso_r, bno_r)
+        if result:
+            X, _ = result
+            prob = _get_crisis_probability("energy_crisis", X)
+            if prob is not None:
+                env["energy_crisis"] = prob
+            else:
+                # fallback binary
+                ret = float((uso_r.iloc[-1] - uso_r.iloc[0]) / (1 + uso_r.iloc[0]))
+                env["energy_crisis"] = 1.0 if abs(uso_r.rolling(30).sum().iloc[-1]) > 0.12 else 0.0
+    except Exception as e:
+        print(f"energy_crisis detection error: {e}")
+
+    # credit_crisis
+    try:
+        hyg_r = _fetch_returns("HYG", period="90d")
+        lqd_r = _fetch_returns("LQD", period="90d")
+        result = _align_series(hyg_r, lqd_r)
+        if result:
+            X, _ = result
+            prob = _get_crisis_probability("credit_crisis", X)
+            if prob is not None:
+                env["credit_crisis"] = prob
+            else:
+                env["credit_crisis"] = 1.0 if hyg_r.rolling(30).sum().iloc[-1] < -0.05 else 0.0
+    except Exception as e:
+        print(f"credit_crisis detection error: {e}")
+
+    # currency_crisis
+    try:
+        uup_r = _fetch_returns("UUP", period="90d")
+        fxe_r = _fetch_returns("FXE", period="90d")
+        result = _align_series(uup_r, fxe_r)
+        if result:
+            X, _ = result
+            prob = _get_crisis_probability("currency_crisis", X)
+            if prob is not None:
+                env["currency_crisis"] = prob
+            else:
+                env["currency_crisis"] = 1.0 if abs(uup_r.rolling(30).sum().iloc[-1]) > 0.05 else 0.0
+    except Exception as e:
+        print(f"currency_crisis detection error: {e}")
+
+    # market_crash
+    try:
+        spy_r = _fetch_returns("SPY", period="90d")
+        vix_raw = yf.download("^VIX", period="90d", progress=False)["Close"].squeeze().dropna()
+        vix_r = vix_raw.pct_change().dropna()
+        result = _align_series(spy_r, vix_r)
+        if result:
+            X, _ = result
+            prob = _get_crisis_probability("market_crash", X)
+            if prob is not None:
+                env["market_crash"] = prob
+            else:
+                env["market_crash"] = 1.0 if spy_r.rolling(30).sum().iloc[-1] < -0.10 else 0.0
+    except Exception as e:
+        print(f"market_crash detection error: {e}")
+
+    return env
+
+
+def update_misfit_weights(environment):
+    # Bayesian win rate weighting (unchanged)
+    for name in misfit_scorecard:
+        sc = misfit_scorecard[name]
+        total = sc.get("total", 0)
+        correct = sc.get("correct", 0)
+        if total >= 10:
+            posterior = (correct + 1) / (total + 2)
+            sc["weight"] = round(max(0.5, min(2.5, posterior / 0.5)), 2)
+        else:
+            sc["weight"] = 1.0
+
+    # Continuous environment boost using HMM crisis probabilities
+    # Formula: weight = 1.0 + (crisis_probability * (max_boost - 1.0))
+    # At prob=1.0: weight = max_boost (same ceiling as before)
+    # At prob=0.5: weight = 1.0 + 0.5 * (max_boost - 1.0)
+    # At prob=0.0: weight = 1.0 (no boost)
+    boosts = {
+        "energy_crisis": [("Andurand", 2.0)],
+        "credit_crisis": [("Tepper", 2.0), ("Druckenmiller", 1.5)],
+        "currency_crisis": [("Soros", 2.0)],
+        "market_crash": [("PTJ", 2.0), ("Druckenmiller", 1.5)]
+    }
+    for env_key, names in boosts.items():
+        crisis_prob = float(environment.get(env_key, 0.0))
+        if crisis_prob > 0.1:
+            for name, max_boost in names:
+                continuous_boost = round(1.0 + (crisis_prob * (max_boost - 1.0)), 3)
+                misfit_scorecard[name]["weight"] = max(misfit_scorecard[name]["weight"], continuous_boost)
 
 
 # ── THESIS PERSISTENCE ────────────────────────────────────────────────────────
@@ -291,51 +546,6 @@ def save_log():
             }, f, indent=2, default=str)
     except Exception as e:
         print(f"Log save error: {e}")
-
-
-# ── ENVIRONMENT DETECTION AND WEIGHTS ────────────────────────────────────────
-
-def detect_environment():
-    env = {"energy_crisis": False, "credit_crisis": False, "currency_crisis": False, "market_crash": False}
-    checks = [
-        ("USO", "energy_crisis", 0.12, "abs"),
-        ("HYG", "credit_crisis", -0.05, "neg"),
-        ("SPY", "market_crash", -0.10, "neg"),
-        ("UUP", "currency_crisis", 0.05, "abs")
-    ]
-    for ticker, key, threshold, direction in checks:
-        try:
-            price = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
-            ret = float((price.iloc[-1] - price.iloc[0]) / price.iloc[0])
-            if direction == "abs" and abs(ret) > threshold:
-                env[key] = True
-            elif direction == "neg" and ret < threshold:
-                env[key] = True
-        except:
-            pass
-    return env
-
-
-def update_misfit_weights(environment):
-    for name in misfit_scorecard:
-        sc = misfit_scorecard[name]
-        total = sc.get("total", 0)
-        correct = sc.get("correct", 0)
-        if total >= 10:
-            posterior = (correct + 1) / (total + 2)
-            sc["weight"] = round(max(0.5, min(2.5, posterior / 0.5)), 2)
-        else:
-            sc["weight"] = 1.0
-    boosts = {
-        "energy_crisis": [("Andurand", 2.0)],
-        "credit_crisis": [("Tepper", 2.0), ("Druckenmiller", 1.5)],
-        "currency_crisis": [("Soros", 2.0)],
-        "market_crash": [("PTJ", 2.0), ("Druckenmiller", 1.5)]
-    }
-    for env_key, names in boosts.items():
-        if environment.get(env_key):
-            for name, boost in names:
-                misfit_scorecard[name]["weight"] = max(misfit_scorecard[name]["weight"], boost)
 
 
 # ── SPECIALIST DATA FEEDS ─────────────────────────────────────────────────────
@@ -495,11 +705,9 @@ def get_andurand_data():
 # Claude outputs ONLY: TICKER, DIRECTION, SCORE, REASON, THESIS.
 # Claude NEVER outputs a price. Prices come from the live price engine above.
 # THESIS is written to disk after every cycle and read back before the next.
-# This is how a real macro trader builds conviction over time instead of
-# reacting to every headline from a blank slate.
 
 def generate_misfit_signal(name, persona, specialist_data, knowledge, weight, price_table, market_note, thesis_context=""):
-    weight_note = f"\nYour environment weight is {weight:.1f}x -- this is your moment, be aggressive." if weight > 1.0 else ""
+    weight_note = f"\nYour environment weight is {weight:.2f}x -- this is your moment, be aggressive." if weight > 1.0 else ""
     data_str = json.dumps(specialist_data, default=str)[:1500]
     knowledge_str = knowledge[:600] if knowledge else ""
     sc = misfit_scorecard.get(name, {})
@@ -702,7 +910,7 @@ def format_position_report(portfolio_state, daily_pnl=None):
     return "\n".join(lines)
 
 
-def format_daily_scorecard(portfolio_state=None):
+def format_daily_scorecard(portfolio_state=None, environment=None):
     total = session_stats["total"]
     if total == 0:
         return "📊 MISFITS SCORECARD\n\nNo cycles yet.\n\n-- Satis House Consulting"
@@ -727,7 +935,15 @@ def format_daily_scorecard(portfolio_state=None):
         sc = misfit_scorecard.get(name, {})
         record = f"{sc.get('correct',0)}/{sc.get('total',0)}" if sc.get("total", 0) > 0 else "no trades"
         weight = sc.get("weight", 1.0)
-        lines.append(f"  {name}: {votes['fired']}/{total_v} signals ({rate:.0f}%) | {record} | {weight:.1f}x")
+        lines.append(f"  {name}: {votes['fired']}/{total_v} signals ({rate:.0f}%) | {record} | {weight:.2f}x")
+
+    if environment:
+        lines.append("\nHMM environment probabilities:")
+        for env_key, prob in environment.items():
+            bar = int(prob * 10)
+            bar_str = "█" * bar + "░" * (10 - bar)
+            lines.append(f"  {env_key}: {bar_str} {prob:.0%}")
+
     lines.append("\nActive theses:")
     for name in THESIS_FILES:
         path = THESIS_FILES[name]
@@ -742,6 +958,7 @@ def format_daily_scorecard(portfolio_state=None):
                 lines.append(f"  {name}: no thesis yet")
         except:
             lines.append(f"  {name}: thesis unreadable")
+
     lines.append(net_line)
     lines.append("\n-- Satis House Consulting")
     return "\n".join(lines)
@@ -1073,6 +1290,7 @@ misfit_knowledge = {}
 misfit_data = {}
 knowledge_refresh_cycles = 8
 cycle_count = 0
+last_environment = {"energy_crisis": 0.0, "credit_crisis": 0.0, "currency_crisis": 0.0, "market_crash": 0.0}
 
 
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
@@ -1081,7 +1299,8 @@ def send_startup_message():
     send_performance("""🚀 MISFITS CONTEST MODEL -- LIVE
 
 Five legendary traders. One contest every 15 minutes.
-Thesis persistence layer active -- all five Misfits now build conviction across cycles.
+Thesis persistence layer active -- all five Misfits build conviction across cycles.
+HMM environment detection active -- continuous crisis probabilities replace binary flags.
 
 PRICING GUARANTEE:
 All prices fetched live from market data API before any Misfit speaks.
@@ -1097,6 +1316,7 @@ Competing against OmniscientBot on a separate account.
 def run_cycle():
     global cycle_count, misfit_knowledge, misfit_data
     global daily_start_value, trades_halted_today, recent_signals, orders_this_cycle, daily_scorecard_sent
+    global last_environment
 
     cycle_count += 1
     orders_this_cycle = 0
@@ -1105,7 +1325,11 @@ def run_cycle():
     now_et = datetime.now(et)
 
     if now_et.hour == 9 and now_et.minute < 15 and not daily_scorecard_sent:
-        send_performance(format_daily_scorecard(get_portfolio_state()))
+        # Retrain HMMs daily at 9 AM before scorecard fires
+        print("Daily HMM retrain...")
+        train_environment_hmms()
+        portfolio_state_for_card = get_portfolio_state()
+        send_performance(format_daily_scorecard(portfolio_state_for_card, last_environment))
         daily_scorecard_sent = True
     if now_et.hour >= 9 and now_et.minute >= 15:
         daily_scorecard_sent = False
@@ -1121,6 +1345,7 @@ def run_cycle():
             del recent_signals[key]
 
     environment = detect_environment()
+    last_environment = environment
     update_misfit_weights(environment)
 
     portfolio_state = get_portfolio_state()
@@ -1163,8 +1388,9 @@ def run_cycle():
     if is_friday_short_blocked():
         market_note += " FRIDAY RULE: DIRECTION must be BUY only after 2 PM ET."
 
-    env_active = [k for k, v in environment.items() if v]
-    print(f"Cycle {cycle_count} | VIX {vix:.1f} | Env: {env_active or 'standard'} | Running contest...")
+    # Show continuous probabilities in cycle log
+    env_summary = " | ".join([f"{k.replace('_crisis','').replace('_crash','')}={v:.0%}" for k, v in environment.items() if v > 0.05])
+    print(f"Cycle {cycle_count} | VIX {vix:.1f} | Env: {env_summary or 'standard'} | Running contest...")
 
     signals_scored = {}
     signal_texts = {}
@@ -1189,21 +1415,21 @@ def run_cycle():
 
         if parsed and score >= MIN_SIGNAL_SCORE:
             session_stats["misfit_signals"][name]["fired"] += 1
-            print(f"  {name}: SIGNAL {parsed['ticker']} {parsed['direction'].upper()} @ ${parsed['entry']:.4f} score={score:.3f}")
+            print(f"  {name} ({weight:.2f}x): SIGNAL {parsed['ticker']} {parsed['direction'].upper()} @ ${parsed['entry']:.4f} score={score:.3f}")
         else:
             session_stats["misfit_signals"][name]["skipped"] += 1
-            print(f"  {name}: score={score:.3f} -- below threshold")
+            print(f"  {name} ({weight:.2f}x): score={score:.3f} -- below threshold")
 
     winners = run_contest(signals_scored)
     session_stats["total"] += 1
 
-    brief = f"MISFITS CONTEST -- CYCLE {cycle_count}\nEnvironment: {', '.join(env_active) if env_active else 'standard'}\n\n"
+    brief = f"MISFITS CONTEST -- CYCLE {cycle_count}\nEnv: {env_summary or 'standard'}\n\n"
     for name, (signal, score) in signals_scored.items():
         weight = misfit_scorecard.get(name, {}).get("weight", 1.0)
         if signal:
-            brief += f"{name} ({weight:.1f}x): {signal['ticker']} {signal['direction'].upper()} score={score:.3f}\n"
+            brief += f"{name} ({weight:.2f}x): {signal['ticker']} {signal['direction'].upper()} score={score:.3f}\n"
         else:
-            brief += f"{name} ({weight:.1f}x): no valid signal\n"
+            brief += f"{name} ({weight:.2f}x): no valid signal\n"
 
     if winners:
         session_stats["execute"] += 1
@@ -1233,9 +1459,11 @@ while True:
             load_log()
             start_aisstream()
             time.sleep(3)
+            train_environment_hmms()
             send_startup_message()
         run_cycle()
     except Exception as e:
         send_telegram(f"Misfits error: {e}")
         print(f"Error: {e}")
         smart_sleep(900)
+
