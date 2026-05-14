@@ -28,6 +28,11 @@ ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 LOG_FILE = "/tmp/misfits_log.json"
 INCEPTION_VALUE = 100000
 
+# ── OPTIONS FLAG ──────────────────────────────────────────────────────────────
+# Flip to True when Alpaca Options Level 3 is approved.
+# All option execution logic is ready. Nothing else changes.
+OPTIONS_ENABLED = False
+
 THESIS_FILES = {
     "Soros": "/tmp/soros_thesis.json",
     "Druckenmiller": "/tmp/druckenmiller_thesis.json",
@@ -57,16 +62,6 @@ STOP_PCT = 0.05
 TARGET_PCT = 0.15
 
 LEVERAGED_ETFS = {"TQQQ", "SOXL", "TECL", "FAS", "ERX", "TMF", "SPXL", "UPRO"}
-
-TRADEABLE_UNIVERSE = [
-    "SOXL", "TECL", "TQQQ", "FAS", "ERX",
-    "QQQ", "SPY", "IWM", "XLF",
-    "GLD", "SLV", "TLT", "HYG", "UUP",
-    "USO", "BNO", "UNG", "XLE", "XOP", "FRO", "VLO",
-    "EEM", "EWZ", "TUR", "FXE",
-    "BTC-USD", "ETH-USD", "SOL-USD"
-]
-
 CRYPTO_TICKERS = {"BTC-USD", "ETH-USD", "SOL-USD"}
 CRYPTO_ALPACA_MAP = {
     "BTC-USD": "BTC/USD",
@@ -74,21 +69,121 @@ CRYPTO_ALPACA_MAP = {
     "SOL-USD": "SOL/USD"
 }
 
-live_price_cache = {}
-price_cache_timestamps = {}
-PRICE_CACHE_TTL = 60
+# ── EXPANDED TRADEABLE UNIVERSE ───────────────────────────────────────────────
+# Full universe available to all Misfits.
+# Each Misfit also has a specialist subset shown first in their price table.
+# Correlation groups prevent two winners from the same asset cluster.
 
-recent_signals = {}
-daily_start_value = None
-trades_halted_today = False
-orders_this_cycle = 0
-hormuz_vessels = []
-hormuz_lock = threading.Lock()
-daily_scorecard_sent = False
+TRADEABLE_UNIVERSE = [
+    # Leveraged ETFs
+    "SOXL", "TECL", "TQQQ", "FAS", "ERX", "SPXL",
+    # US broad market
+    "SPY", "QQQ", "IWM", "MDY",
+    # Sector ETFs
+    "XLK", "XLF", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE",
+    # Tech / Semis
+    "SMH", "SOXX", "NVDA", "AAPL", "MSFT",
+    # Financials
+    "JPM", "BAC", "GS", "KRE",
+    # Fixed income
+    "TLT", "IEF", "SHY", "HYG", "JNK", "LQD", "EMB", "MBB",
+    # Precious metals / commodities
+    "GLD", "SLV", "PDBC",
+    # Energy ETFs
+    "USO", "BNO", "UNG", "XLE", "XOP",
+    # Energy single names
+    "XOM", "CVX", "COP", "SLB", "VLO", "FRO",
+    # FX
+    "UUP", "FXE", "FXY", "FXB",
+    # International / EM
+    "EEM", "EWZ", "TUR", "EWJ", "EWG", "EWU", "FXI", "INDA",
+    # Volatility
+    "UVXY",
+    # Crypto
+    "BTC-USD", "ETH-USD", "SOL-USD"
+]
 
-# HMM models trained at startup, refreshed daily
-# Each model is a tuple: (fitted_GaussianHMM, crisis_state_index)
-# crisis_state_index is determined after training by examining state means
+# ── SPECIALIST UNIVERSES ──────────────────────────────────────────────────────
+# Each Misfit sees their specialist assets first in the price table,
+# followed by the full universe. This focuses signal generation without
+# restricting it -- a Misfit can still trade anything.
+
+MISFIT_UNIVERSE = {
+    "Soros": [
+        "UUP", "FXE", "FXY", "FXB",
+        "EEM", "EWZ", "TUR", "EWJ", "EWG", "EWU", "FXI", "INDA",
+        "EMB", "GLD", "TLT",
+        "SPY", "QQQ", "HYG"
+    ],
+    "Druckenmiller": [
+        "SPY", "QQQ", "IWM", "MDY",
+        "TQQQ", "SPXL", "SOXL",
+        "NVDA", "AAPL", "MSFT",
+        "XLK", "XLF", "XLV", "XLI",
+        "HYG", "JNK", "LQD", "TLT", "IEF",
+        "GLD", "BTC-USD"
+    ],
+    "PTJ": [
+        "SPY", "QQQ", "IWM",
+        "TQQQ", "SOXL", "TECL", "FAS", "SPXL",
+        "SMH", "SOXX", "XLK",
+        "XLV", "XLI", "XLY", "XLP",
+        "UVXY", "GLD", "TLT",
+        "KRE", "XLF"
+    ],
+    "Tepper": [
+        "SPY", "QQQ", "XLF", "FAS",
+        "JPM", "BAC", "GS",
+        "HYG", "JNK", "LQD", "EMB", "MBB",
+        "TLT", "IEF", "SHY",
+        "KRE", "EEM"
+    ],
+    "Andurand": [
+        "USO", "BNO", "UNG",
+        "XLE", "XOP", "ERX",
+        "XOM", "CVX", "COP", "SLB", "VLO", "FRO",
+        "GLD", "SLV", "PDBC",
+        "UUP", "EWZ", "TUR"
+    ]
+}
+
+# ── CORRELATION GROUPS ────────────────────────────────────────────────────────
+# Two winners cannot come from the same correlation group in one cycle.
+# This prevents holding BNO + USO simultaneously (same trade, two tickers).
+# The contest checks this before awarding a second winner slot.
+
+CORRELATION_GROUPS = {
+    "crude_oil":        {"USO", "BNO"},
+    "energy_equity":    {"XLE", "XOP", "ERX", "XOM", "CVX", "COP", "SLB", "VLO"},
+    "nat_gas":          {"UNG"},
+    "tankers":          {"FRO"},
+    "broad_commodities":{"PDBC", "GLD", "SLV"},
+    "gold":             {"GLD", "SLV"},
+    "tech_momentum":    {"QQQ", "TQQQ", "TECL", "XLK", "AAPL", "MSFT"},
+    "semis":            {"SOXL", "SOXX", "SMH", "NVDA"},
+    "broad_market":     {"SPY", "SPXL", "IWM", "MDY"},
+    "financials":       {"XLF", "FAS", "JPM", "BAC", "GS", "KRE"},
+    "bonds_long":       {"TLT", "IEF", "SHY", "MBB"},
+    "bonds_hy":         {"HYG", "JNK", "LQD", "EMB"},
+    "dollar_fx":        {"UUP", "FXE", "FXY", "FXB"},
+    "em_equity":        {"EEM", "EWZ", "TUR", "EWJ", "EWG", "EWU", "FXI", "INDA"},
+    "volatility":       {"UVXY"},
+    "bitcoin":          {"BTC-USD"},
+    "ethereum":         {"ETH-USD"},
+    "solana":           {"SOL-USD"},
+    "sectors_defensive":{"XLV", "XLP", "XLU", "XLRE"},
+    "sectors_cyclical": {"XLI", "XLY", "XLB"},
+}
+
+def get_correlation_group(ticker):
+    for group, members in CORRELATION_GROUPS.items():
+        if ticker in members:
+            return group
+    return f"solo_{ticker}"
+
+
+# ── HMM ENVIRONMENT DETECTION ─────────────────────────────────────────────────
+
 hmm_models = {
     "energy_crisis": None,
     "credit_crisis": None,
@@ -96,111 +191,6 @@ hmm_models = {
     "market_crash": None
 }
 
-misfit_scorecard = {
-    "Soros": {"correct": 0, "total": 0, "weight": 1.0},
-    "Druckenmiller": {"correct": 0, "total": 0, "weight": 1.0},
-    "PTJ": {"correct": 0, "total": 0, "weight": 1.0},
-    "Tepper": {"correct": 0, "total": 0, "weight": 1.0},
-    "Andurand": {"correct": 0, "total": 0, "weight": 1.0}
-}
-
-session_stats = {
-    "execute": 0,
-    "pass": 0,
-    "total": 0,
-    "misfit_signals": {
-        "Soros": {"fired": 0, "skipped": 0},
-        "Druckenmiller": {"fired": 0, "skipped": 0},
-        "PTJ": {"fired": 0, "skipped": 0},
-        "Tepper": {"fired": 0, "skipped": 0},
-        "Andurand": {"fired": 0, "skipped": 0}
-    }
-}
-
-trade_history = []
-
-
-# ── LIVE PRICE ENGINE ─────────────────────────────────────────────────────────
-# This is the ONLY source of prices in the entire system.
-# Claude NEVER provides a price. Claude only provides ticker and direction.
-# All prices are fetched from yfinance and locked before any Misfit speaks.
-
-def get_live_price(ticker):
-    now = time.time()
-    if ticker in live_price_cache and (now - price_cache_timestamps.get(ticker, 0)) < PRICE_CACHE_TTL:
-        return live_price_cache[ticker]
-    try:
-        data = yf.download(ticker, period="2d", interval="1m", progress=False, auto_adjust=True)
-        if data.empty:
-            data = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
-        if not data.empty:
-            price = float(data["Close"].squeeze().dropna().iloc[-1])
-            live_price_cache[ticker] = price
-            price_cache_timestamps[ticker] = now
-            return price
-    except Exception as e:
-        print(f"Price fetch error {ticker}: {e}")
-    return None
-
-
-def fetch_all_live_prices():
-    prices = {}
-    print("Fetching live prices for all tradeable assets...")
-    for ticker in TRADEABLE_UNIVERSE:
-        price = get_live_price(ticker)
-        if price:
-            prices[ticker] = price
-        time.sleep(0.15)
-    print(f"Live prices confirmed for {len(prices)}/{len(TRADEABLE_UNIVERSE)} assets")
-    return prices
-
-
-def build_price_table(prices):
-    lines = [
-        "VERIFIED LIVE PRICES -- fetched this second from market data API",
-        "You MUST pick a ticker from this list. You MUST NOT invent any price.",
-        ""
-    ]
-    for ticker in TRADEABLE_UNIVERSE:
-        if ticker in prices:
-            lines.append(f"  {ticker}: ${prices[ticker]:.4f}")
-        else:
-            lines.append(f"  {ticker}: UNAVAILABLE -- do not use")
-    return "\n".join(lines)
-
-
-def apply_live_price(ticker, direction, prices):
-    price = prices.get(ticker)
-    if price is None:
-        return None
-    entry = price
-    if direction == "buy":
-        stop = round(entry * (1 - STOP_PCT), 4)
-        target = round(entry * (1 + TARGET_PCT), 4)
-    else:
-        stop = round(entry * (1 + STOP_PCT), 4)
-        target = round(entry * (1 - TARGET_PCT), 4)
-    win_size = abs(target - entry)
-    loss_size = abs(entry - stop)
-    risk_reward = win_size / loss_size if loss_size > 0 else 3.0
-    return {
-        "entry": entry,
-        "stop": stop,
-        "target": target,
-        "win_size": win_size,
-        "loss_size": loss_size,
-        "risk_reward": round(risk_reward, 2)
-    }
-
-
-# ── HMM ENVIRONMENT DETECTION ─────────────────────────────────────────────────
-# Replaces binary detect_environment() with continuous probability scores.
-# Each environment has its own 3-state Gaussian HMM trained on specialist emissions.
-# Crisis state is identified by examining state means after training.
-# Output: probability 0.0 to 1.0 of currently being in crisis regime.
-# This detects regime transitions BEFORE price confirms them.
-# Trained at startup. Retrained daily at 9 AM alongside scorecard.
-# Falls back to binary threshold detection if HMM fails.
 
 def _fetch_returns(ticker, period="3y"):
     try:
@@ -247,9 +237,6 @@ def _fit_hmm(X, n_states=3):
 def train_environment_hmms():
     global hmm_models
     print("Training environment HMMs on 3 years of historical data...")
-
-    # energy_crisis: USO and BNO daily returns
-    # Crisis state = highest mean return (oil price spike)
     try:
         uso_r = _fetch_returns("USO")
         bno_r = _fetch_returns("BNO")
@@ -258,16 +245,12 @@ def train_environment_hmms():
             X, n_obs = result
             model = _fit_hmm(X)
             if model:
-                # crisis = state with highest mean USO return (oil spike)
                 uso_means = [model.means_[i][0] for i in range(3)]
                 crisis_idx = int(np.argmax(uso_means))
                 hmm_models["energy_crisis"] = (model, crisis_idx)
-                print(f"  energy_crisis HMM trained on {n_obs} obs | crisis state {crisis_idx} mean USO={uso_means[crisis_idx]:.4f}")
+                print(f"  energy_crisis trained on {n_obs} obs | crisis state mean USO={uso_means[crisis_idx]:.4f}")
     except Exception as e:
         print(f"  energy_crisis HMM failed: {e}")
-
-    # credit_crisis: HYG and LQD daily returns
-    # Crisis state = lowest mean return (credit selling off)
     try:
         hyg_r = _fetch_returns("HYG")
         lqd_r = _fetch_returns("LQD")
@@ -279,12 +262,9 @@ def train_environment_hmms():
                 hyg_means = [model.means_[i][0] for i in range(3)]
                 crisis_idx = int(np.argmin(hyg_means))
                 hmm_models["credit_crisis"] = (model, crisis_idx)
-                print(f"  credit_crisis HMM trained on {n_obs} obs | crisis state {crisis_idx} mean HYG={hyg_means[crisis_idx]:.4f}")
+                print(f"  credit_crisis trained on {n_obs} obs | crisis state mean HYG={hyg_means[crisis_idx]:.4f}")
     except Exception as e:
         print(f"  credit_crisis HMM failed: {e}")
-
-    # currency_crisis: UUP and inverse FXE daily returns
-    # Crisis state = highest absolute UUP move (extreme dollar stress either direction)
     try:
         uup_r = _fetch_returns("UUP")
         fxe_r = _fetch_returns("FXE")
@@ -293,20 +273,15 @@ def train_environment_hmms():
             X, n_obs = result
             model = _fit_hmm(X)
             if model:
-                # crisis = state with highest variance (extreme moves)
                 uup_vars = [model.covars_[i][0][0] for i in range(3)]
                 crisis_idx = int(np.argmax(uup_vars))
                 hmm_models["currency_crisis"] = (model, crisis_idx)
-                print(f"  currency_crisis HMM trained on {n_obs} obs | crisis state {crisis_idx} UUP var={uup_vars[crisis_idx]:.6f}")
+                print(f"  currency_crisis trained on {n_obs} obs | crisis state UUP var={uup_vars[crisis_idx]:.6f}")
     except Exception as e:
         print(f"  currency_crisis HMM failed: {e}")
-
-    # market_crash: SPY returns and VIX normalized to same scale as returns
-    # Crisis state = lowest SPY mean return (market falling)
     try:
         spy_r = _fetch_returns("SPY")
-        vix_raw = yf.download("^VIX", period="3y", progress=False)["Close"].squeeze().dropna()
-        vix_r = vix_raw.pct_change().dropna()
+        vix_r = yf.download("^VIX", period="3y", progress=False)["Close"].squeeze().dropna().pct_change().dropna()
         result = _align_series(spy_r, vix_r)
         if result:
             X, n_obs = result
@@ -315,10 +290,9 @@ def train_environment_hmms():
                 spy_means = [model.means_[i][0] for i in range(3)]
                 crisis_idx = int(np.argmin(spy_means))
                 hmm_models["market_crash"] = (model, crisis_idx)
-                print(f"  market_crash HMM trained on {n_obs} obs | crisis state {crisis_idx} mean SPY={spy_means[crisis_idx]:.4f}")
+                print(f"  market_crash trained on {n_obs} obs | crisis state mean SPY={spy_means[crisis_idx]:.4f}")
     except Exception as e:
         print(f"  market_crash HMM failed: {e}")
-
     print("HMM training complete.")
 
 
@@ -335,12 +309,7 @@ def _get_crisis_probability(env_key, recent_X):
 
 
 def detect_environment():
-    # Returns continuous probabilities 0.0 to 1.0 for each environment.
-    # Values above 0.1 are meaningful. Values above 0.5 are significant.
-    # Falls back to binary threshold detection if HMM model unavailable.
     env = {"energy_crisis": 0.0, "credit_crisis": 0.0, "currency_crisis": 0.0, "market_crash": 0.0}
-
-    # energy_crisis
     try:
         uso_r = _fetch_returns("USO", period="90d")
         bno_r = _fetch_returns("BNO", period="90d")
@@ -348,16 +317,9 @@ def detect_environment():
         if result:
             X, _ = result
             prob = _get_crisis_probability("energy_crisis", X)
-            if prob is not None:
-                env["energy_crisis"] = prob
-            else:
-                # fallback binary
-                ret = float((uso_r.iloc[-1] - uso_r.iloc[0]) / (1 + uso_r.iloc[0]))
-                env["energy_crisis"] = 1.0 if abs(uso_r.rolling(30).sum().iloc[-1]) > 0.12 else 0.0
+            env["energy_crisis"] = prob if prob is not None else (1.0 if abs(uso_r.rolling(30).sum().iloc[-1]) > 0.12 else 0.0)
     except Exception as e:
         print(f"energy_crisis detection error: {e}")
-
-    # credit_crisis
     try:
         hyg_r = _fetch_returns("HYG", period="90d")
         lqd_r = _fetch_returns("LQD", period="90d")
@@ -365,14 +327,9 @@ def detect_environment():
         if result:
             X, _ = result
             prob = _get_crisis_probability("credit_crisis", X)
-            if prob is not None:
-                env["credit_crisis"] = prob
-            else:
-                env["credit_crisis"] = 1.0 if hyg_r.rolling(30).sum().iloc[-1] < -0.05 else 0.0
+            env["credit_crisis"] = prob if prob is not None else (1.0 if hyg_r.rolling(30).sum().iloc[-1] < -0.05 else 0.0)
     except Exception as e:
         print(f"credit_crisis detection error: {e}")
-
-    # currency_crisis
     try:
         uup_r = _fetch_returns("UUP", period="90d")
         fxe_r = _fetch_returns("FXE", period="90d")
@@ -380,34 +337,23 @@ def detect_environment():
         if result:
             X, _ = result
             prob = _get_crisis_probability("currency_crisis", X)
-            if prob is not None:
-                env["currency_crisis"] = prob
-            else:
-                env["currency_crisis"] = 1.0 if abs(uup_r.rolling(30).sum().iloc[-1]) > 0.05 else 0.0
+            env["currency_crisis"] = prob if prob is not None else (1.0 if abs(uup_r.rolling(30).sum().iloc[-1]) > 0.05 else 0.0)
     except Exception as e:
         print(f"currency_crisis detection error: {e}")
-
-    # market_crash
     try:
         spy_r = _fetch_returns("SPY", period="90d")
-        vix_raw = yf.download("^VIX", period="90d", progress=False)["Close"].squeeze().dropna()
-        vix_r = vix_raw.pct_change().dropna()
+        vix_r = yf.download("^VIX", period="90d", progress=False)["Close"].squeeze().dropna().pct_change().dropna()
         result = _align_series(spy_r, vix_r)
         if result:
             X, _ = result
             prob = _get_crisis_probability("market_crash", X)
-            if prob is not None:
-                env["market_crash"] = prob
-            else:
-                env["market_crash"] = 1.0 if spy_r.rolling(30).sum().iloc[-1] < -0.10 else 0.0
+            env["market_crash"] = prob if prob is not None else (1.0 if spy_r.rolling(30).sum().iloc[-1] < -0.10 else 0.0)
     except Exception as e:
         print(f"market_crash detection error: {e}")
-
     return env
 
 
 def update_misfit_weights(environment):
-    # Bayesian win rate weighting (unchanged)
     for name in misfit_scorecard:
         sc = misfit_scorecard[name]
         total = sc.get("total", 0)
@@ -417,17 +363,11 @@ def update_misfit_weights(environment):
             sc["weight"] = round(max(0.5, min(2.5, posterior / 0.5)), 2)
         else:
             sc["weight"] = 1.0
-
-    # Continuous environment boost using HMM crisis probabilities
-    # Formula: weight = 1.0 + (crisis_probability * (max_boost - 1.0))
-    # At prob=1.0: weight = max_boost (same ceiling as before)
-    # At prob=0.5: weight = 1.0 + 0.5 * (max_boost - 1.0)
-    # At prob=0.0: weight = 1.0 (no boost)
     boosts = {
-        "energy_crisis": [("Andurand", 2.0)],
-        "credit_crisis": [("Tepper", 2.0), ("Druckenmiller", 1.5)],
+        "energy_crisis":   [("Andurand", 2.0)],
+        "credit_crisis":   [("Tepper", 2.0), ("Druckenmiller", 1.5)],
         "currency_crisis": [("Soros", 2.0)],
-        "market_crash": [("PTJ", 2.0), ("Druckenmiller", 1.5)]
+        "market_crash":    [("PTJ", 2.0), ("Druckenmiller", 1.5)]
     }
     for env_key, names in boosts.items():
         crisis_prob = float(environment.get(env_key, 0.0))
@@ -437,12 +377,165 @@ def update_misfit_weights(environment):
                 misfit_scorecard[name]["weight"] = max(misfit_scorecard[name]["weight"], continuous_boost)
 
 
+# ── LIVE PRICE ENGINE ─────────────────────────────────────────────────────────
+
+live_price_cache = {}
+price_cache_timestamps = {}
+PRICE_CACHE_TTL = 60
+
+
+def get_live_price(ticker):
+    now = time.time()
+    if ticker in live_price_cache and (now - price_cache_timestamps.get(ticker, 0)) < PRICE_CACHE_TTL:
+        return live_price_cache[ticker]
+    try:
+        data = yf.download(ticker, period="2d", interval="1m", progress=False, auto_adjust=True)
+        if data.empty:
+            data = yf.download(ticker, period="5d", interval="5m", progress=False, auto_adjust=True)
+        if not data.empty:
+            price = float(data["Close"].squeeze().dropna().iloc[-1])
+            live_price_cache[ticker] = price
+            price_cache_timestamps[ticker] = now
+            return price
+    except Exception as e:
+        print(f"Price fetch error {ticker}: {e}")
+    return None
+
+
+def fetch_all_live_prices():
+    prices = {}
+    print("Fetching live prices for expanded universe...")
+    for ticker in TRADEABLE_UNIVERSE:
+        price = get_live_price(ticker)
+        if price:
+            prices[ticker] = price
+        time.sleep(0.1)
+    print(f"Live prices confirmed for {len(prices)}/{len(TRADEABLE_UNIVERSE)} assets")
+    return prices
+
+
+def build_specialist_price_table(misfit_name, prices):
+    specialist = MISFIT_UNIVERSE.get(misfit_name, [])
+    other = [t for t in TRADEABLE_UNIVERSE if t not in specialist]
+
+    lines = [
+        "VERIFIED LIVE PRICES -- fetched this second from market data API",
+        "You MUST pick a ticker from this list. You MUST NOT invent any price.",
+        "",
+        f"YOUR SPECIALIST ASSETS ({misfit_name} domain -- your primary hunting ground):"
+    ]
+    for ticker in specialist:
+        if ticker in prices:
+            lines.append(f"  {ticker}: ${prices[ticker]:.4f}")
+        else:
+            lines.append(f"  {ticker}: UNAVAILABLE")
+
+    lines.append("")
+    lines.append("FULL UNIVERSE (available if specialist assets lack opportunity):")
+    for ticker in other:
+        if ticker in prices:
+            lines.append(f"  {ticker}: ${prices[ticker]:.4f}")
+        else:
+            lines.append(f"  {ticker}: UNAVAILABLE")
+
+    return "\n".join(lines)
+
+
+def apply_live_price(ticker, direction, prices):
+    price = prices.get(ticker)
+    if price is None:
+        return None
+    entry = price
+    if direction == "buy":
+        stop = round(entry * (1 - STOP_PCT), 4)
+        target = round(entry * (1 + TARGET_PCT), 4)
+    else:
+        stop = round(entry * (1 + STOP_PCT), 4)
+        target = round(entry * (1 - TARGET_PCT), 4)
+    win_size = abs(target - entry)
+    loss_size = abs(entry - stop)
+    risk_reward = win_size / loss_size if loss_size > 0 else 3.0
+    return {
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "win_size": win_size,
+        "loss_size": loss_size,
+        "risk_reward": round(risk_reward, 2)
+    }
+
+
+# ── OPTIONS ARCHITECTURE ──────────────────────────────────────────────────────
+# Dormant until OPTIONS_ENABLED = True (Alpaca Level 3 approval).
+# When enabled: Misfits can propose an options overlay on their equity signal.
+# PTJ: long OTM calls/puts for asymmetric breakout plays (his 5:1 framework)
+# Soros: long puts on EM ETFs for reflexivity collapse expressions
+# Andurand: long calls on energy ETFs to avoid leveraged ETF decay
+# Druckenmiller: protective puts on concentrated long positions
+# Tepper: long calls on financials when Fed pivots
+#
+# Options signal format (when OPTIONS_ENABLED = True):
+# OPT_TICKER: QQQ
+# OPT_TYPE: PUT
+# OPT_DTE: 45
+# OPT_MONEYNESS: ATM  (ATM / 5PCT_OTM / 10PCT_OTM)
+# OPT_SCORE: 7
+
+def get_options_chain(ticker, dte_target=45):
+    if not OPTIONS_ENABLED:
+        return None
+    try:
+        t = yf.Ticker(ticker)
+        expiries = t.options
+        if not expiries:
+            return None
+        today = datetime.now().date()
+        best = min(expiries, key=lambda e: abs((datetime.strptime(e, "%Y-%m-%d").date() - today).days - dte_target))
+        chain = t.option_chain(best)
+        return {"expiry": best, "calls": chain.calls, "puts": chain.puts}
+    except:
+        return None
+
+
+def select_option_contract(chain, direction, moneyness, current_price):
+    if not OPTIONS_ENABLED or chain is None:
+        return None
+    try:
+        contracts = chain["calls"] if direction == "call" else chain["puts"]
+        if moneyness == "ATM":
+            target_strike = current_price
+        elif moneyness == "5PCT_OTM":
+            target_strike = current_price * (1.05 if direction == "call" else 0.95)
+        elif moneyness == "10PCT_OTM":
+            target_strike = current_price * (1.10 if direction == "call" else 0.90)
+        else:
+            target_strike = current_price
+        idx = (contracts["strike"] - target_strike).abs().idxmin()
+        return contracts.loc[idx]
+    except:
+        return None
+
+
+def execute_options_order(contract, qty, action):
+    if not OPTIONS_ENABLED:
+        return "Options disabled -- flip OPTIONS_ENABLED = True when Level 3 approved"
+    try:
+        symbol = contract["contractSymbol"]
+        order = {
+            "symbol": symbol,
+            "qty": str(qty),
+            "side": action,
+            "type": "market",
+            "time_in_force": "day",
+            "order_class": "simple"
+        }
+        result = alpaca_request("POST", "/v2/orders", order)
+        return result
+    except Exception as e:
+        return f"Options order error: {e}"
+
+
 # ── THESIS PERSISTENCE ────────────────────────────────────────────────────────
-# Each Misfit maintains a persistent thesis written after every cycle.
-# The thesis is read back at the start of the next cycle.
-# Signal flows FROM the thesis, not FROM the news headline.
-# This is what separates a macro trader from a reactive trader.
-# Thesis resets on container restart and rebuilds within a few cycles. Acceptable.
 
 def read_thesis(name):
     path = THESIS_FILES.get(name)
@@ -481,10 +574,8 @@ def save_thesis(name, raw_output):
                 thesis_line = line.split(":", 1)[1].strip()
             if line.upper().startswith("SCORE:"):
                 score_line = line.split(":", 1)[1].strip()
-
         if not thesis_line:
             return
-
         existing_age = 0
         if os.path.exists(path):
             try:
@@ -493,12 +584,10 @@ def save_thesis(name, raw_output):
                 existing_age = existing.get("thesis_age_cycles", 0)
             except:
                 pass
-
         try:
             conviction = float(score_line)
         except:
             conviction = 5.0
-
         with open(path, "w") as f:
             json.dump({
                 "current_view": thesis_line,
@@ -512,6 +601,39 @@ def save_thesis(name, raw_output):
 
 
 # ── PERSISTENT LOG ────────────────────────────────────────────────────────────
+
+recent_signals = {}
+daily_start_value = None
+trades_halted_today = False
+orders_this_cycle = 0
+hormuz_vessels = []
+hormuz_lock = threading.Lock()
+daily_scorecard_sent = False
+last_environment = {"energy_crisis": 0.0, "credit_crisis": 0.0, "currency_crisis": 0.0, "market_crash": 0.0}
+
+misfit_scorecard = {
+    "Soros": {"correct": 0, "total": 0, "weight": 1.0},
+    "Druckenmiller": {"correct": 0, "total": 0, "weight": 1.0},
+    "PTJ": {"correct": 0, "total": 0, "weight": 1.0},
+    "Tepper": {"correct": 0, "total": 0, "weight": 1.0},
+    "Andurand": {"correct": 0, "total": 0, "weight": 1.0}
+}
+
+session_stats = {
+    "execute": 0,
+    "pass": 0,
+    "total": 0,
+    "misfit_signals": {
+        "Soros": {"fired": 0, "skipped": 0},
+        "Druckenmiller": {"fired": 0, "skipped": 0},
+        "PTJ": {"fired": 0, "skipped": 0},
+        "Tepper": {"fired": 0, "skipped": 0},
+        "Andurand": {"fired": 0, "skipped": 0}
+    }
+}
+
+trade_history = []
+
 
 def load_log():
     global session_stats, trade_history, misfit_scorecard
@@ -572,7 +694,7 @@ def get_soros_data():
     try:
         usdx = get_fred("DTWEXBGS")
         if usdx: data["dollar_index"] = usdx
-        for pair, ticker in [("EUR_USD", "EURUSD=X"), ("GBP_USD", "GBPUSD=X"), ("TUR", "TUR"), ("EWZ", "EWZ")]:
+        for pair, ticker in [("EUR_USD", "EURUSD=X"), ("GBP_USD", "GBPUSD=X"), ("JPY_USD", "JPYUSD=X"), ("TUR", "TUR"), ("EWZ", "EWZ"), ("FXI", "FXI")]:
             try:
                 px = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
                 data[f"{pair}_30d_pct"] = round(float((px.iloc[-1] - px.iloc[0]) / px.iloc[0] * 100), 2)
@@ -600,7 +722,7 @@ def get_druckenmiller_data():
         for series, label in [("BAMLH0A0HYM2", "hy_spread"), ("WALCL", "fed_balance_sheet"), ("DRCCLACBS", "cc_delinquency")]:
             val = get_fred(series)
             if val: data[label] = val
-        for asset in ["SPY", "QQQ", "HYG", "TLT", "IWM"]:
+        for asset in ["SPY", "QQQ", "HYG", "TLT", "IWM", "NVDA", "XLK"]:
             try:
                 px = yf.download(asset, period="60d", progress=False)["Close"].squeeze()
                 data[f"{asset}_20d_mom"] = round(float((px.iloc[-1] - px.iloc[-20]) / px.iloc[-20] * 100), 2)
@@ -618,7 +740,7 @@ def get_ptj_data():
         data["vix_current"] = round(float(vix.iloc[-1]), 1)
         data["vix_30d_avg"] = round(float(vix.rolling(30).mean().iloc[-1]), 1)
         data["vix_regime"] = "ELEVATED" if float(vix.iloc[-1]) > float(vix.rolling(30).mean().iloc[-1]) else "NORMAL"
-        for ticker in ["SPY", "QQQ", "IWM"]:
+        for ticker in ["SPY", "QQQ", "IWM", "SMH", "XLK"]:
             try:
                 df = yf.download(ticker, period="200d", progress=False)
                 close = df["Close"].squeeze()
@@ -645,6 +767,12 @@ def get_tepper_data():
                 y = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
                 data[f"treasury_{mat}"] = round(float(y.iloc[-1]), 2)
                 data[f"treasury_{mat}_30d_change"] = round(float(y.iloc[-1] - y.iloc[0]), 2)
+            except:
+                pass
+        for bank in ["JPM", "BAC", "GS"]:
+            try:
+                px = yf.download(bank, period="30d", progress=False)["Close"].squeeze()
+                data[f"{bank}_30d_pct"] = round(float((px.iloc[-1] - px.iloc[0]) / px.iloc[0] * 100), 2)
             except:
                 pass
         try:
@@ -674,7 +802,7 @@ def get_andurand_data():
             pass
         with hormuz_lock:
             data["vessels_near_hormuz"] = len(hormuz_vessels)
-        for ticker, name in [("USO", "wti"), ("BNO", "brent"), ("UNG", "natgas"), ("ERX", "energy_2x"), ("FRO", "tankers")]:
+        for ticker, name in [("USO", "wti"), ("BNO", "brent"), ("UNG", "natgas"), ("ERX", "energy_2x"), ("FRO", "tankers"), ("XOM", "exxon"), ("CVX", "chevron")]:
             try:
                 px = yf.download(ticker, period="30d", progress=False)["Close"].squeeze()
                 data[f"{name}_30d_pct"] = round(float((px.iloc[-1] - px.iloc[0]) / px.iloc[0] * 100), 2)
@@ -702,9 +830,6 @@ def get_andurand_data():
 
 
 # ── MISFIT SIGNAL GENERATION ──────────────────────────────────────────────────
-# Claude outputs ONLY: TICKER, DIRECTION, SCORE, REASON, THESIS.
-# Claude NEVER outputs a price. Prices come from the live price engine above.
-# THESIS is written to disk after every cycle and read back before the next.
 
 def generate_misfit_signal(name, persona, specialist_data, knowledge, weight, price_table, market_note, thesis_context=""):
     weight_note = f"\nYour environment weight is {weight:.2f}x -- this is your moment, be aggressive." if weight > 1.0 else ""
@@ -712,8 +837,18 @@ def generate_misfit_signal(name, persona, specialist_data, knowledge, weight, pr
     knowledge_str = knowledge[:600] if knowledge else ""
     sc = misfit_scorecard.get(name, {})
     record = f"Your record: {sc.get('correct',0)}/{sc.get('total',0)} correct." if sc.get("total", 0) > 0 else "No closed trades yet."
-
     thesis_block = f"\n{thesis_context}\n" if thesis_context else ""
+
+    options_note = ""
+    if OPTIONS_ENABLED:
+        options_note = """
+OPTIONAL OPTIONS OVERLAY: If your conviction is 8 or above, you may also propose an options position.
+Add these lines after your five required lines (leave blank if no options play):
+OPT_TICKER: [underlying ticker]
+OPT_TYPE: [CALL or PUT]
+OPT_DTE: [target days to expiry, typically 30-45]
+OPT_MONEYNESS: [ATM or 5PCT_OTM or 10PCT_OTM]
+"""
 
     prompt = f"""{persona}{weight_note}
 {thesis_block}
@@ -728,8 +863,9 @@ YOUR KNOWLEDGE BASE:
 {record}
 
 {market_note}
-
+{options_note}
 YOUR TASK:
+Your specialist assets are shown first. Hunt there first. Go wider only if your specialist domain lacks a clear opportunity.
 If you have a persistent thesis above, check whether new data confirms, weakens, or flips it.
 Do not abandon a thesis on noise. Only revise it when new evidence is meaningful.
 Find the single best trade that flows from your current view of the world.
@@ -749,7 +885,7 @@ THESIS: [one sentence -- your current market view, updated by what you just saw,
 
     msg = client.messages.create(
         model="claude-opus-4-5-20251101",
-        max_tokens=150,
+        max_tokens=200,
         messages=[{"role": "user", "content": prompt}]
     )
     return msg.content[0].text.strip()
@@ -793,6 +929,24 @@ def parse_signal_output(raw_text, prices):
         if price_data is None:
             return None
 
+        # Parse optional options overlay
+        options_signal = None
+        if OPTIONS_ENABLED:
+            opt_ticker = result.get("OPT_TICKER", "").strip().upper()
+            opt_type = result.get("OPT_TYPE", "").strip().upper()
+            opt_dte = result.get("OPT_DTE", "45").strip()
+            opt_moneyness = result.get("OPT_MONEYNESS", "ATM").strip().upper()
+            if opt_ticker and opt_type in ("CALL", "PUT"):
+                try:
+                    options_signal = {
+                        "ticker": opt_ticker,
+                        "type": opt_type.lower(),
+                        "dte": int(opt_dte),
+                        "moneyness": opt_moneyness
+                    }
+                except:
+                    pass
+
         return {
             "ticker": ticker,
             "direction": direction,
@@ -804,7 +958,8 @@ def parse_signal_output(raw_text, prices):
             "risk_reward": price_data["risk_reward"],
             "win_size": price_data["win_size"],
             "loss_size": price_data["loss_size"],
-            "price_source": "live_yfinance"
+            "price_source": "live_yfinance",
+            "options_signal": options_signal
         }
     except Exception as e:
         print(f"Signal parse error: {e}")
@@ -828,18 +983,32 @@ def run_contest(signals_scored):
     sorted_signals = sorted(signals_scored.items(), key=lambda x: x[1][1], reverse=True)
     winners = []
     used_tickers = set()
+    used_correlation_groups = set()
+
     for name, (signal, score) in sorted_signals:
         if score < MIN_SIGNAL_SCORE:
             continue
         if signal is None:
             continue
         ticker = signal["ticker"]
+
+        # Block duplicate tickers
         if ticker in used_tickers:
             continue
+
+        # Block correlated positions -- no two winners from same cluster
+        group = get_correlation_group(ticker)
+        if group in used_correlation_groups:
+            print(f"  Contest: {name} ({ticker}) blocked -- correlation group {group} already won")
+            continue
+
         winners.append((name, signal, score))
         used_tickers.add(ticker)
+        used_correlation_groups.add(group)
+
         if len(winners) >= MAX_ORDERS_PER_CYCLE:
             break
+
     return winners
 
 
@@ -877,6 +1046,7 @@ def send_performance(message):
 def format_trade_alert(name, signal, position_size, score):
     action = "Bought" if signal["direction"] == "buy" else "Sold Short"
     emoji = "🟢" if signal["direction"] == "buy" else "🔴"
+    group = get_correlation_group(signal["ticker"])
     return f"""{emoji} THE MISFITS JUST TRADED
 
 {name} won the contest.
@@ -885,6 +1055,7 @@ Price source: live market data (yfinance)
 Stop loss: ${signal['stop']:.4f} | Target: ${signal['target']:.4f}
 Risk reward: {signal['risk_reward']:.1f} to 1
 Bet size: ${position_size:,.0f} | Contest score: {score:.2f}
+Correlation group: {group}
 
 Why: {signal['reason']}
 
@@ -924,6 +1095,7 @@ def format_daily_scorecard(portfolio_state=None, environment=None):
         net_line = f"\n{'📈' if net >= 0 else '📉'} Net profit since inception: {'+' if net >= 0 else ''}${net:,.0f} ({net_pct:+.2f}%)"
     lines = [
         "📊 MISFITS DAILY SCORECARD\n",
+        f"Universe: {len(TRADEABLE_UNIVERSE)} assets | Options: {'LIVE' if OPTIONS_ENABLED else 'pending approval'}",
         f"Total cycles: {total}",
         f"✅ Trades executed: {execute} ({execute/total*100:.0f}%)",
         f"⏭ No qualifying signal: {passed} ({passed/total*100:.0f}%)",
@@ -936,14 +1108,12 @@ def format_daily_scorecard(portfolio_state=None, environment=None):
         record = f"{sc.get('correct',0)}/{sc.get('total',0)}" if sc.get("total", 0) > 0 else "no trades"
         weight = sc.get("weight", 1.0)
         lines.append(f"  {name}: {votes['fired']}/{total_v} signals ({rate:.0f}%) | {record} | {weight:.2f}x")
-
     if environment:
         lines.append("\nHMM environment probabilities:")
         for env_key, prob in environment.items():
             bar = int(prob * 10)
             bar_str = "█" * bar + "░" * (10 - bar)
             lines.append(f"  {env_key}: {bar_str} {prob:.0%}")
-
     lines.append("\nActive theses:")
     for name in THESIS_FILES:
         path = THESIS_FILES[name]
@@ -958,7 +1128,6 @@ def format_daily_scorecard(portfolio_state=None, environment=None):
                 lines.append(f"  {name}: no thesis yet")
         except:
             lines.append(f"  {name}: thesis unreadable")
-
     lines.append(net_line)
     lines.append("\n-- Satis House Consulting")
     return "\n".join(lines)
@@ -998,7 +1167,8 @@ def close_position(symbol):
 
 
 def submit_market_order(symbol, qty, side, notional=None):
-    order = {"symbol": symbol, "side": side, "type": "market", "time_in_force": "day"}
+    tif = "gtc" if "/" in symbol else "day"
+    order = {"symbol": symbol, "side": side, "type": "market", "time_in_force": tif}
     if notional:
         order["notional"] = str(round(notional, 2))
     else:
@@ -1144,6 +1314,14 @@ def execute_winner(name, signal, position_size, portfolio_state, vix):
                 recent_signals[f"{ticker}_{direction}"] = 0
                 trade_history.append({"ticker": ticker, "direction": direction, "entry_price": entry_price, "misfit": name, "executed": True, "timestamp": datetime.now(pytz.utc).isoformat()})
                 save_log()
+                # Options overlay for crypto if enabled
+                if OPTIONS_ENABLED and signal.get("options_signal"):
+                    opt = signal["options_signal"]
+                    chain = get_options_chain(opt["ticker"], opt["dte"])
+                    if chain:
+                        contract = select_option_contract(chain, opt["type"], opt["moneyness"], entry_price)
+                        if contract is not None:
+                            execute_options_order(contract, 1, "buy")
                 return f"Crypto executed: {alpaca_symbol} ${notional:,.0f} at ~${entry_price:.4f}"
             return f"Crypto order failed: {result.get('message', 'unknown')}"
 
@@ -1171,6 +1349,14 @@ def execute_winner(name, signal, position_size, portfolio_state, vix):
             recent_signals[f"{ticker}_{direction}"] = 0
             trade_history.append({"ticker": ticker, "direction": direction, "entry_price": entry_price, "misfit": name, "executed": True, "timestamp": datetime.now(pytz.utc).isoformat()})
             save_log()
+            # Options overlay if enabled
+            if OPTIONS_ENABLED and signal.get("options_signal"):
+                opt = signal["options_signal"]
+                chain = get_options_chain(opt["ticker"], opt["dte"])
+                if chain:
+                    contract = select_option_contract(chain, opt["type"], opt["moneyness"], entry_price)
+                    if contract is not None:
+                        execute_options_order(contract, 1, "buy")
             return f"Executed: {direction.upper()} {qty} {ticker} at ${entry_price:.4f} | Stop: ${stop_price:.4f}"
         return f"{ticker} position closed -- stop loss submission failed"
     except Exception as e:
@@ -1261,27 +1447,27 @@ def smart_sleep(seconds):
 
 MISFITS = [
     ("Soros",
-     """You ARE George Soros. You see reflexivity everywhere -- self-reinforcing feedback loops that eventually collapse. You broke the Bank of England. You find the lie everyone believes and bet against it when defenders run out of ammunition. Your specialist data covers currency stress, sovereign debt, emerging market capital flows, and central bank reserve positions. Trade anything where you see an unsustainable narrative or reflexivity reversal.""",
+     """You ARE George Soros. You see reflexivity everywhere -- self-reinforcing feedback loops that eventually collapse. You broke the Bank of England. You find the lie everyone believes and bet against it when defenders run out of ammunition. Your specialist domain is FX, sovereign debt, and emerging markets. You hunt in currencies, EM equity, and international ETFs first. Trade anything where you see an unsustainable narrative or reflexivity reversal.""",
      ["George Soros reflexivity currency crisis Black Wednesday 1992",
-      "Soros Fund Management macro sovereign debt views 2025 2026"]),
+      "Soros Fund Management macro sovereign debt EM views 2025 2026"]),
 
     ("Druckenmiller",
-     """You ARE Stanley Druckenmiller. You think about what you can lose before what you can make. Your stop is sacred. You concentrate into your single best idea when conviction is high. Your specialist data covers credit spreads, Federal Reserve balance sheet, macro momentum across asset classes, and earnings revisions. Trade the highest conviction asymmetric opportunity you can find anywhere in the market.""",
+     """You ARE Stanley Druckenmiller. You think about what you can lose before what you can make. Your stop is sacred. You concentrate into your single best idea when conviction is high. Your specialist domain is macro momentum, credit cycles, and concentrated equity. You hunt in broad market ETFs, mega cap tech, credit instruments, and hard assets. Trade the highest conviction asymmetric opportunity anywhere in the market.""",
      ["Stanley Druckenmiller concentration asymmetric bet stop loss methodology",
       "Druckenmiller macro credit Federal Reserve views 2025 2026"]),
 
     ("PTJ",
-     """You ARE Paul Tudor Jones. You called Black Monday 1987. You never trade for less than 5 to 1 risk reward. The chart tells the truth before the fundamentals do. Your specialist data covers VIX regime, volume breakouts, momentum signals, and technical structure. Find the cleanest technical setup with the most defined risk in the market right now.""",
+     """You ARE Paul Tudor Jones. You called Black Monday 1987. You never trade for less than 5 to 1 risk reward. The chart tells the truth before the fundamentals do. Your specialist domain is technical momentum and volatility. You hunt in index ETFs, sector momentum plays, and volatility instruments. Find the cleanest technical setup with the most defined risk in the market right now.""",
      ["Paul Tudor Jones 5 to 1 risk reward Black Monday technical analysis",
       "PTJ trend following technical momentum views 2025 2026"]),
 
     ("Tepper",
-     """You ARE David Tepper. You made 7 billion dollars in 2009 reading the government's intent before the market did. When the Federal Reserve is on your side you buy everything. Your specialist data covers high yield spreads, Treasury yields, credit delinquency rates, and Federal Reserve policy signals. Find the trade where policy backstop creates asymmetric upside.""",
+     """You ARE David Tepper. You made 7 billion dollars in 2009 reading the government's intent before the market did. When the Federal Reserve is on your side you buy everything. Your specialist domain is Fed policy, credit markets, and financial sector. You hunt in bank stocks, credit ETFs, Treasury instruments, and financials. Find the trade where policy backstop creates asymmetric upside.""",
      ["David Tepper 2009 bank trade Federal Reserve policy reading",
       "Tepper credit Fed policy macro views 2025 2026"]),
 
     ("Andurand",
-     """You ARE Pierre Andurand. Physical markets always lead paper markets. You track molecules not narratives. You called 2008 oil and 2022 Russia Ukraine energy crisis by reading physical flows before they showed in price. Your specialist data covers Cushing storage draws, Hormuz vessel traffic, crude futures positioning, crack spreads, and oil-linked currencies. Find the energy or commodity trade where physical reality diverges from paper price.""",
+     """You ARE Pierre Andurand. Physical markets always lead paper markets. You track molecules not narratives. You called 2008 oil and 2022 Russia Ukraine energy crisis by reading physical flows before they showed in price. Your specialist domain is energy, commodities, and physical market flows. You hunt in crude oil ETFs, energy equity, tankers, energy single names, and commodity-linked currencies. Find the energy or commodity trade where physical reality diverges from paper price.""",
      ["Pierre Andurand physical commodity flows Hormuz oil 2008 2022",
       "Andurand Capital energy oil physical market views 2025 2026"])
 ]
@@ -1290,23 +1476,24 @@ misfit_knowledge = {}
 misfit_data = {}
 knowledge_refresh_cycles = 8
 cycle_count = 0
-last_environment = {"energy_crisis": 0.0, "credit_crisis": 0.0, "currency_crisis": 0.0, "market_crash": 0.0}
 
 
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
 def send_startup_message():
-    send_performance("""🚀 MISFITS CONTEST MODEL -- LIVE
+    send_performance(f"""🚀 MISFITS CONTEST MODEL -- LIVE
 
 Five legendary traders. One contest every 15 minutes.
-Thesis persistence layer active -- all five Misfits build conviction across cycles.
-HMM environment detection active -- continuous crisis probabilities replace binary flags.
+Universe: {len(TRADEABLE_UNIVERSE)} assets across specialists domains.
+Thesis persistence: active -- conviction builds across cycles.
+HMM environment detection: active -- continuous crisis probabilities.
+Correlation groups: active -- no two winners from same asset cluster.
+Options: {'LIVE' if OPTIONS_ENABLED else 'pending Alpaca Level 3 approval -- architecture ready'}.
 
 PRICING GUARANTEE:
 All prices fetched live from market data API before any Misfit speaks.
 Claude outputs ONLY ticker and direction -- never a price.
 Entry = live price. Stop = 5% from live. Target = 15% from live.
-Zero hallucination possible by architecture.
 
 Competing against OmniscientBot on a separate account.
 
@@ -1325,7 +1512,6 @@ def run_cycle():
     now_et = datetime.now(et)
 
     if now_et.hour == 9 and now_et.minute < 15 and not daily_scorecard_sent:
-        # Retrain HMMs daily at 9 AM before scorecard fires
         print("Daily HMM retrain...")
         train_environment_hmms()
         portfolio_state_for_card = get_portfolio_state()
@@ -1363,7 +1549,6 @@ def run_cycle():
         report_positions(portfolio_state)
 
     live_prices = fetch_all_live_prices()
-    price_table = build_price_table(live_prices)
 
     if cycle_count % knowledge_refresh_cycles == 1:
         print("Refreshing Misfit knowledge and specialist data...")
@@ -1388,34 +1573,30 @@ def run_cycle():
     if is_friday_short_blocked():
         market_note += " FRIDAY RULE: DIRECTION must be BUY only after 2 PM ET."
 
-    # Show continuous probabilities in cycle log
     env_summary = " | ".join([f"{k.replace('_crisis','').replace('_crash','')}={v:.0%}" for k, v in environment.items() if v > 0.05])
     print(f"Cycle {cycle_count} | VIX {vix:.1f} | Env: {env_summary or 'standard'} | Running contest...")
 
     signals_scored = {}
-    signal_texts = {}
 
     for name, persona, queries in MISFITS:
         data = misfit_data.get(name, {})
         knowledge = misfit_knowledge.get(name, "")
         weight = misfit_scorecard.get(name, {}).get("weight", 1.0)
 
-        # Read this Misfit's persistent thesis before they speak
         thesis_context = read_thesis(name)
+        price_table = build_specialist_price_table(name, live_prices)
 
         raw = generate_misfit_signal(name, persona, data, knowledge, weight, price_table, market_note, thesis_context)
-
-        # Save updated thesis immediately after signal generation
         save_thesis(name, raw)
 
-        signal_texts[name] = raw
         parsed = parse_signal_output(raw, live_prices)
         score = score_signal(parsed, name, environment)
         signals_scored[name] = (parsed, score)
 
         if parsed and score >= MIN_SIGNAL_SCORE:
             session_stats["misfit_signals"][name]["fired"] += 1
-            print(f"  {name} ({weight:.2f}x): SIGNAL {parsed['ticker']} {parsed['direction'].upper()} @ ${parsed['entry']:.4f} score={score:.3f}")
+            group = get_correlation_group(parsed["ticker"])
+            print(f"  {name} ({weight:.2f}x): SIGNAL {parsed['ticker']} [{group}] {parsed['direction'].upper()} score={score:.3f}")
         else:
             session_stats["misfit_signals"][name]["skipped"] += 1
             print(f"  {name} ({weight:.2f}x): score={score:.3f} -- below threshold")
@@ -1427,7 +1608,8 @@ def run_cycle():
     for name, (signal, score) in signals_scored.items():
         weight = misfit_scorecard.get(name, {}).get("weight", 1.0)
         if signal:
-            brief += f"{name} ({weight:.2f}x): {signal['ticker']} {signal['direction'].upper()} score={score:.3f}\n"
+            group = get_correlation_group(signal["ticker"])
+            brief += f"{name} ({weight:.2f}x): {signal['ticker']} [{group}] {signal['direction'].upper()} score={score:.3f}\n"
         else:
             brief += f"{name} ({weight:.2f}x): no valid signal\n"
 
